@@ -14,8 +14,8 @@
       {
         "label": "main",
         "title": "English Pet",
-        "width": 220,
-        "height": 248,
+        "width": 280,
+        "height": 280,
         "resizable": false,
         "fullscreen": false,
         "transparent": true,

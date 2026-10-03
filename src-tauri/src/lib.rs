@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    sync::{mpsc, Mutex},
+    sync::{Mutex, mpsc},
     thread,
     time::{Duration as StdDuration, Instant},
 };
@@ -12,13 +12,13 @@ use chrono::{DateTime, Duration, Local, LocalResult, TimeZone, Timelike, Utc};
 use fsrs::{FSRS, MemoryState};
 use keyring::Entry;
 use reqwest::Client;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tauri::{
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, RunEvent, State,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, RunEvent, State,
 };
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_global_shortcut::ShortcutState;
@@ -31,6 +31,7 @@ const DEFAULT_MODEL: &str = "";
 const HOTKEY: &str = "CommandOrControl+Shift+E";
 const REMINDER_COOLDOWN: StdDuration = StdDuration::from_secs(60 * 60);
 const NO_CARD_CHECK: StdDuration = StdDuration::from_secs(24 * 60 * 60);
+const WINDOW_MARGIN: i32 = 12;
 
 struct AppState {
     db: Mutex<Connection>,
@@ -75,6 +76,8 @@ struct SettingsPayload {
     quiet_hours_start: u8,
     quiet_hours_end: u8,
     pet_passthrough: bool,
+    pet_size: String,
+    pet_opacity: f32,
     ai_enabled: bool,
     autostart: bool,
     has_api_key: bool,
@@ -97,6 +100,8 @@ struct SaveSettingsInput {
     quiet_hours_start: u8,
     quiet_hours_end: u8,
     pet_passthrough: bool,
+    pet_size: String,
+    pet_opacity: f32,
     ai_enabled: bool,
     autostart: bool,
     api_key: Option<String>,
@@ -163,7 +168,10 @@ struct ImportResult {
 }
 
 fn app_db_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     Ok(dir.join("english-pet.db"))
 }
@@ -234,6 +242,8 @@ fn initialize_db(connection: &Connection) -> Result<(), String> {
         ("quiet_hours_start", "22"),
         ("quiet_hours_end", "8"),
         ("pet_passthrough", "false"),
+        ("pet_size", "medium"),
+        ("pet_opacity", "1"),
         ("ai_enabled", "true"),
         ("reminder_snoozed_until", ""),
     ] {
@@ -249,7 +259,9 @@ fn initialize_db(connection: &Connection) -> Result<(), String> {
 
 fn setting(connection: &Connection, key: &str) -> Result<String, String> {
     connection
-        .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0))
+        .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -262,6 +274,52 @@ fn upsert_setting(connection: &Connection, key: &str, value: &str) -> Result<(),
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn pet_dimensions(size: &str) -> (f64, f64) {
+    match size {
+        "small" => (224.0, 224.0),
+        "large" => (350.0, 350.0),
+        _ => (280.0, 280.0),
+    }
+}
+
+fn clamp_coordinate(value: i32, minimum: i32, maximum: i32) -> i32 {
+    value.clamp(minimum, maximum.max(minimum))
+}
+
+fn fit_window(window: &tauri::WebviewWindow, width: f64, height: f64) -> Result<(), String> {
+    let monitor = window
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .ok_or("Không tìm thấy màn hình.")?;
+    let scale = monitor.scale_factor();
+    let work_area = monitor.work_area();
+    let max_width =
+        ((work_area.size.width as i32 - WINDOW_MARGIN * 2).max(1) as f64 / scale).floor();
+    let max_height =
+        ((work_area.size.height as i32 - WINDOW_MARGIN * 2).max(1) as f64 / scale).floor();
+    let width = width.min(max_width);
+    let height = height.min(max_height);
+    let size = LogicalSize::new(width, height);
+    let current = window.outer_position().map_err(|error| error.to_string())?;
+    let current_size = window.outer_size().map_err(|error| error.to_string())?;
+    let target_width = (width * scale).round() as i32;
+    let target_height = (height * scale).round() as i32;
+    let right = current.x + current_size.width as i32;
+    let bottom = current.y + current_size.height as i32;
+    let min_x = work_area.position.x + WINDOW_MARGIN;
+    let min_y = work_area.position.y + WINDOW_MARGIN;
+    let max_x = work_area.position.x + work_area.size.width as i32 - target_width - WINDOW_MARGIN;
+    let max_y = work_area.position.y + work_area.size.height as i32 - target_height - WINDOW_MARGIN;
+    window.set_size(size).map_err(|error| error.to_string())?;
+    window
+        .set_position(PhysicalPosition::new(
+            clamp_coordinate(right - target_width, min_x, max_x),
+            clamp_coordinate(bottom - target_height, min_y, max_y),
+        ))
+        .map_err(|error| error.to_string())
 }
 
 fn has_api_key() -> bool {
@@ -301,7 +359,8 @@ fn is_quiet_hour(hour: u32, start: u8, end: u8) -> bool {
 fn until_quiet_ends(now: DateTime<Local>, end: u8) -> StdDuration {
     let now_minutes = i64::from(now.hour() * 60 + now.minute());
     let end_minutes = i64::from(end) * 60;
-    let seconds = ((end_minutes - now_minutes).rem_euclid(24 * 60) * 60 - i64::from(now.second())).max(1);
+    let seconds =
+        ((end_minutes - now_minutes).rem_euclid(24 * 60) * 60 - i64::from(now.second())).max(1);
     StdDuration::from_secs(seconds as u64)
 }
 
@@ -310,21 +369,31 @@ enum ReminderAction {
     Wait(StdDuration),
 }
 
-fn reminder_action(state: &AppState, last_notification: Option<Instant>) -> Result<ReminderAction, String> {
+fn reminder_action(
+    state: &AppState,
+    last_notification: Option<Instant>,
+) -> Result<ReminderAction, String> {
     let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
     if let Ok(snoozed_until) = setting(&connection, "reminder_snoozed_until") {
         if let Ok(snoozed_until) = parse_due(&snoozed_until) {
             let current = Utc::now();
             if snoozed_until > current {
                 return Ok(ReminderAction::Wait(
-                    snoozed_until.signed_duration_since(current).to_std().unwrap_or(StdDuration::ZERO),
+                    snoozed_until
+                        .signed_duration_since(current)
+                        .to_std()
+                        .unwrap_or(StdDuration::ZERO),
                 ));
             }
             upsert_setting(&connection, "reminder_snoozed_until", "")?;
         }
     }
     let next_due_at: Option<String> = connection
-        .query_row("SELECT due_at FROM vocabulary ORDER BY due_at LIMIT 1", [], |row| row.get(0))
+        .query_row(
+            "SELECT due_at FROM vocabulary ORDER BY due_at LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
         .optional()
         .map_err(|error| error.to_string())?;
     let Some(next_due_at) = next_due_at else {
@@ -334,14 +403,24 @@ fn reminder_action(state: &AppState, last_notification: Option<Instant>) -> Resu
     let current = Utc::now();
     if next_due > current {
         return Ok(ReminderAction::Wait(
-            next_due.signed_duration_since(current).to_std().unwrap_or(StdDuration::ZERO),
+            next_due
+                .signed_duration_since(current)
+                .to_std()
+                .unwrap_or(StdDuration::ZERO),
         ));
     }
 
-    let quiet_start = setting(&connection, "quiet_hours_start")?.parse().unwrap_or(22);
-    let quiet_end = setting(&connection, "quiet_hours_end")?.parse().unwrap_or(8);
+    let quiet_start = setting(&connection, "quiet_hours_start")?
+        .parse()
+        .unwrap_or(22);
+    let quiet_end = setting(&connection, "quiet_hours_end")?
+        .parse()
+        .unwrap_or(8);
     if is_quiet_hour(Local::now().hour(), quiet_start, quiet_end) {
-        return Ok(ReminderAction::Wait(until_quiet_ends(Local::now(), quiet_end)));
+        return Ok(ReminderAction::Wait(until_quiet_ends(
+            Local::now(),
+            quiet_end,
+        )));
     }
     if let Some(last) = last_notification {
         let elapsed = last.elapsed();
@@ -350,7 +429,11 @@ fn reminder_action(state: &AppState, last_notification: Option<Instant>) -> Resu
         }
     }
     let due_count = connection
-        .query_row("SELECT COUNT(*) FROM vocabulary WHERE due_at <= ?1", [now()], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM vocabulary WHERE due_at <= ?1",
+            [now()],
+            |row| row.get(0),
+        )
         .map_err(|error| error.to_string())?;
     Ok(ReminderAction::Notify(due_count))
 }
@@ -374,7 +457,9 @@ fn start_reminder_scheduler(app: AppHandle, receiver: mpsc::Receiver<()>) {
                         .and_then(|window| window.is_visible().ok())
                         .unwrap_or(false);
                     if !pet_is_visible {
-                        let _ = app.notification().builder()
+                        let _ = app
+                            .notification()
+                            .builder()
                             .title("English Pet có từ đến hạn")
                             .body(format!("Có {due_count} từ chờ ôn. Mở pet để ôn 1 phút."))
                             .show();
@@ -395,17 +480,30 @@ fn dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
     let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
     let current_time = now();
     let due_count = connection
-        .query_row("SELECT COUNT(*) FROM vocabulary WHERE due_at <= ?1", [current_time], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM vocabulary WHERE due_at <= ?1",
+            [current_time],
+            |row| row.get(0),
+        )
         .map_err(|error| error.to_string())?;
     let total_words = connection
         .query_row("SELECT COUNT(*) FROM vocabulary", [], |row| row.get(0))
         .map_err(|error| error.to_string())?;
     let next_due_at = connection
-        .query_row("SELECT due_at FROM vocabulary ORDER BY due_at LIMIT 1", [], |row| row.get(0))
+        .query_row(
+            "SELECT due_at FROM vocabulary ORDER BY due_at LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
         .optional()
         .map_err(|error| error.to_string())?;
     let pet_passthrough = setting(&connection, "pet_passthrough")? == "true";
-    Ok(Dashboard { due_count, total_words, next_due_at, pet_passthrough })
+    Ok(Dashboard {
+        due_count,
+        total_words,
+        next_due_at,
+        pet_passthrough,
+    })
 }
 
 #[tauri::command]
@@ -414,10 +512,21 @@ fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<SettingsPa
     Ok(SettingsPayload {
         endpoint: setting(&connection, "endpoint")?,
         model: setting(&connection, "model")?,
-        desired_retention: setting(&connection, "desired_retention")?.parse().unwrap_or(0.9),
-        quiet_hours_start: setting(&connection, "quiet_hours_start")?.parse().unwrap_or(22),
-        quiet_hours_end: setting(&connection, "quiet_hours_end")?.parse().unwrap_or(8),
+        desired_retention: setting(&connection, "desired_retention")?
+            .parse()
+            .unwrap_or(0.9),
+        quiet_hours_start: setting(&connection, "quiet_hours_start")?
+            .parse()
+            .unwrap_or(22),
+        quiet_hours_end: setting(&connection, "quiet_hours_end")?
+            .parse()
+            .unwrap_or(8),
         pet_passthrough: setting(&connection, "pet_passthrough")? == "true",
+        pet_size: setting(&connection, "pet_size").unwrap_or_else(|_| "medium".into()),
+        pet_opacity: setting(&connection, "pet_opacity")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1.0),
         ai_enabled: setting(&connection, "ai_enabled")? == "true",
         autostart: app.autolaunch().is_enabled().unwrap_or(false),
         has_api_key: has_api_key(),
@@ -425,7 +534,11 @@ fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<SettingsPa
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, state: State<'_, AppState>, input: SaveSettingsInput) -> Result<(), String> {
+fn save_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: SaveSettingsInput,
+) -> Result<(), String> {
     let endpoint = input.endpoint.trim().trim_end_matches('/').to_string();
     if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
         return Err("9Router endpoint phải bắt đầu bằng http:// hoặc https://.".into());
@@ -439,14 +552,38 @@ fn save_settings(app: AppHandle, state: State<'_, AppState>, input: SaveSettings
     if input.quiet_hours_start > 23 || input.quiet_hours_end > 23 {
         return Err("Giờ yên lặng không hợp lệ.".into());
     }
+    if !matches!(input.pet_size.as_str(), "small" | "medium" | "large") {
+        return Err("Kích thước pet không hợp lệ.".into());
+    }
+    if !input.pet_opacity.is_finite() || !(0.2..=1.0).contains(&input.pet_opacity) {
+        return Err("Độ trong suốt phải nằm trong 20% đến 100%.".into());
+    }
 
     let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
     upsert_setting(&connection, "endpoint", &endpoint)?;
     upsert_setting(&connection, "model", input.model.trim())?;
-    upsert_setting(&connection, "desired_retention", &input.desired_retention.to_string())?;
-    upsert_setting(&connection, "quiet_hours_start", &input.quiet_hours_start.to_string())?;
-    upsert_setting(&connection, "quiet_hours_end", &input.quiet_hours_end.to_string())?;
-    upsert_setting(&connection, "pet_passthrough", &input.pet_passthrough.to_string())?;
+    upsert_setting(
+        &connection,
+        "desired_retention",
+        &input.desired_retention.to_string(),
+    )?;
+    upsert_setting(
+        &connection,
+        "quiet_hours_start",
+        &input.quiet_hours_start.to_string(),
+    )?;
+    upsert_setting(
+        &connection,
+        "quiet_hours_end",
+        &input.quiet_hours_end.to_string(),
+    )?;
+    upsert_setting(
+        &connection,
+        "pet_passthrough",
+        &input.pet_passthrough.to_string(),
+    )?;
+    upsert_setting(&connection, "pet_size", &input.pet_size)?;
+    upsert_setting(&connection, "pet_opacity", &input.pet_opacity.to_string())?;
     upsert_setting(&connection, "ai_enabled", &input.ai_enabled.to_string())?;
     drop(connection);
 
@@ -455,7 +592,9 @@ fn save_settings(app: AppHandle, state: State<'_, AppState>, input: SaveSettings
         if key.is_empty() {
             let _ = entry.delete_credential();
         } else {
-            entry.set_password(&key).map_err(|error| error.to_string())?;
+            entry
+                .set_password(&key)
+                .map_err(|error| error.to_string())?;
         }
     }
     let autostart = app.autolaunch();
@@ -465,14 +604,22 @@ fn save_settings(app: AppHandle, state: State<'_, AppState>, input: SaveSettings
         autostart.disable().map_err(|error| error.to_string())?;
     }
     set_passthrough(&app, input.pet_passthrough)?;
+    let window = app
+        .get_webview_window("main")
+        .ok_or("Pet window unavailable")?;
+    let (width, height) = pet_dimensions(&input.pet_size);
+    fit_window(&window, width, height)?;
     reschedule_reminder(&state);
     Ok(())
 }
 
 #[tauri::command]
 fn capture_clipboard() -> Result<String, String> {
-    let mut clipboard = Clipboard::new().map_err(|error| format!("Không mở được clipboard: {error}"))?;
-    let text = clipboard.get_text().map_err(|_| "Clipboard không có text. Hãy copy từ trước.".to_string())?;
+    let mut clipboard =
+        Clipboard::new().map_err(|error| format!("Không mở được clipboard: {error}"))?;
+    let text = clipboard
+        .get_text()
+        .map_err(|_| "Clipboard không có text. Hãy copy từ trước.".to_string())?;
     let (_, term) = normalize_term(&text)?;
     Ok(term)
 }
@@ -480,11 +627,19 @@ fn capture_clipboard() -> Result<String, String> {
 #[tauri::command]
 fn save_word(state: State<'_, AppState>, input: SaveWordInput) -> Result<CapturedWord, String> {
     let (normalized_term, term) = normalize_term(&input.term)?;
-    let translation = input.translation.filter(|value| !value.trim().is_empty()).map(|value| value.trim().to_string());
-    let example = input.example.filter(|value| !value.trim().is_empty()).map(|value| value.trim().to_string());
+    let translation = input
+        .translation
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+    let example = input
+        .example
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
     let timestamp = now();
     let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
-    let transaction = connection.unchecked_transaction().map_err(|error| error.to_string())?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
     transaction.execute(
         "INSERT INTO vocabulary(term, normalized_term, translation, example, due_at, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5)",
@@ -495,17 +650,30 @@ fn save_word(state: State<'_, AppState>, input: SaveWordInput) -> Result<Capture
     let id = transaction.last_insert_rowid();
     transaction.commit().map_err(|error| error.to_string())?;
     reschedule_reminder(&state);
-    Ok(CapturedWord { id, term, translation, created_at: timestamp })
+    Ok(CapturedWord {
+        id,
+        term,
+        translation,
+        created_at: timestamp,
+    })
 }
 
 fn backup_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app.path().document_dir().map_err(|error| error.to_string())?.join("English Pet Backups");
+    let dir = app
+        .path()
+        .document_dir()
+        .map_err(|error| error.to_string())?
+        .join("English Pet Backups");
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     Ok(dir)
 }
 
 fn backup_filename(extension: &str) -> String {
-    format!("english-pet-{}.{}", Utc::now().format("%Y%m%d-%H%M%S"), extension)
+    format!(
+        "english-pet-{}.{}",
+        Utc::now().format("%Y%m%d-%H%M%S"),
+        extension
+    )
 }
 
 fn export_from_connection(connection: &Connection) -> Result<ExportData, String> {
@@ -513,22 +681,50 @@ fn export_from_connection(connection: &Connection) -> Result<ExportData, String>
         "SELECT id, term, normalized_term, translation, example, stability, difficulty, due_at, last_reviewed_at, created_at, updated_at
          FROM vocabulary ORDER BY id",
     ).map_err(|error| error.to_string())?;
-    let vocabulary = vocabulary_query.query_map([], |row| Ok(ExportVocabulary {
-        id: row.get(0)?, term: row.get(1)?, normalized_term: row.get(2)?, translation: row.get(3)?, example: row.get(4)?,
-        stability: row.get(5)?, difficulty: row.get(6)?, due_at: row.get(7)?, last_reviewed_at: row.get(8)?,
-        created_at: row.get(9)?, updated_at: row.get(10)?,
-    })).map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+    let vocabulary = vocabulary_query
+        .query_map([], |row| {
+            Ok(ExportVocabulary {
+                id: row.get(0)?,
+                term: row.get(1)?,
+                normalized_term: row.get(2)?,
+                translation: row.get(3)?,
+                example: row.get(4)?,
+                stability: row.get(5)?,
+                difficulty: row.get(6)?,
+                due_at: row.get(7)?,
+                last_reviewed_at: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
     let mut review_query = connection.prepare(
         "SELECT vocabulary_id, rating, elapsed_days, scheduled_days, reviewed_at, state_before_json, state_after_json
          FROM review_logs ORDER BY id",
     ).map_err(|error| error.to_string())?;
-    let review_logs = review_query.query_map([], |row| Ok(ExportReviewLog {
-        vocabulary_id: row.get(0)?, rating: row.get(1)?, elapsed_days: row.get(2)?, scheduled_days: row.get(3)?,
-        reviewed_at: row.get(4)?, state_before_json: row.get(5)?, state_after_json: row.get(6)?,
-    })).map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
-    Ok(ExportData { version: 1, exported_at: now(), vocabulary, review_logs })
+    let review_logs = review_query
+        .query_map([], |row| {
+            Ok(ExportReviewLog {
+                vocabulary_id: row.get(0)?,
+                rating: row.get(1)?,
+                elapsed_days: row.get(2)?,
+                scheduled_days: row.get(3)?,
+                reviewed_at: row.get(4)?,
+                state_before_json: row.get(5)?,
+                state_after_json: row.get(6)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(ExportData {
+        version: 1,
+        exported_at: now(),
+        vocabulary,
+        review_logs,
+    })
 }
 
 #[tauri::command]
@@ -547,31 +743,47 @@ fn export_data(app: AppHandle, state: State<'_, AppState>) -> Result<String, Str
 fn backup_sqlite(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     let path = backup_dir(&app)?.join(backup_filename("db"));
     let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
-    connection.backup(rusqlite::MAIN_DB, &path, None).map_err(|error| error.to_string())?;
+    connection
+        .backup(rusqlite::MAIN_DB, &path, None)
+        .map_err(|error| error.to_string())?;
     Ok(path.display().to_string())
 }
 
 fn validate_import_word(word: &ExportVocabulary) -> Result<(String, String), String> {
     let (normalized_term, term) = normalize_term(&word.term)?;
-    if word.translation.as_deref().is_some_and(|text| text.chars().count() > 2_000)
-        || word.example.as_deref().is_some_and(|text| text.chars().count() > 5_000) {
+    if word
+        .translation
+        .as_deref()
+        .is_some_and(|text| text.chars().count() > 2_000)
+        || word
+            .example
+            .as_deref()
+            .is_some_and(|text| text.chars().count() > 5_000)
+    {
         return Err("Import chứa nghĩa hoặc ví dụ quá dài.".into());
     }
     parse_due(&word.due_at)?;
     parse_due(&word.created_at)?;
     parse_due(&word.updated_at)?;
-    if let Some(reviewed_at) = &word.last_reviewed_at { parse_due(reviewed_at)?; }
+    if let Some(reviewed_at) = &word.last_reviewed_at {
+        parse_due(reviewed_at)?;
+    }
     Ok((normalized_term, term))
 }
 
-fn import_into_connection(connection: &Connection, data: ExportData) -> Result<ImportResult, String> {
+fn import_into_connection(
+    connection: &Connection,
+    data: ExportData,
+) -> Result<ImportResult, String> {
     if data.version != 1 {
         return Err("File backup không được hỗ trợ. Cần English Pet export version 1.".into());
     }
     if data.vocabulary.len() > 100_000 || data.review_logs.len() > 1_000_000 {
         return Err("File backup quá lớn.".into());
     }
-    let transaction = connection.unchecked_transaction().map_err(|error| error.to_string())?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
     let mut imported_words = 0;
     let mut skipped_words = 0;
     let mut imported_reviews = 0;
@@ -579,9 +791,14 @@ fn import_into_connection(connection: &Connection, data: ExportData) -> Result<I
     for word in data.vocabulary {
         let original_id = word.id;
         let (normalized_term, term) = validate_import_word(&word)?;
-        let duplicate: Option<i64> = transaction.query_row(
-            "SELECT id FROM vocabulary WHERE normalized_term = ?1", [&normalized_term], |row| row.get(0),
-        ).optional().map_err(|error| error.to_string())?;
+        let duplicate: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM vocabulary WHERE normalized_term = ?1",
+                [&normalized_term],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
         if duplicate.is_some() {
             skipped_words += 1;
             continue;
@@ -592,20 +809,27 @@ fn import_into_connection(connection: &Connection, data: ExportData) -> Result<I
             params![term, normalized_term, word.translation, word.example, word.stability, word.difficulty,
                 word.due_at, word.last_reviewed_at, word.created_at, word.updated_at],
         ).map_err(|error| error.to_string())?;
-        if ids.insert(original_id, transaction.last_insert_rowid()).is_some() {
+        if ids
+            .insert(original_id, transaction.last_insert_rowid())
+            .is_some()
+        {
             return Err("File backup có ID từ vựng trùng lặp.".into());
         }
         imported_words += 1;
     }
     for log in data.review_logs {
-        let Some(&vocabulary_id) = ids.get(&log.vocabulary_id) else { continue; };
+        let Some(&vocabulary_id) = ids.get(&log.vocabulary_id) else {
+            continue;
+        };
         if !(1..=4).contains(&log.rating) || log.elapsed_days < 0 || log.scheduled_days < 0 {
             return Err("File backup có review log không hợp lệ.".into());
         }
         parse_due(&log.reviewed_at)?;
-        serde_json::from_str::<Value>(&log.state_after_json).map_err(|_| "File backup có FSRS state lỗi.".to_string())?;
+        serde_json::from_str::<Value>(&log.state_after_json)
+            .map_err(|_| "File backup có FSRS state lỗi.".to_string())?;
         if let Some(state_before) = &log.state_before_json {
-            serde_json::from_str::<Value>(state_before).map_err(|_| "File backup có FSRS state lỗi.".to_string())?;
+            serde_json::from_str::<Value>(state_before)
+                .map_err(|_| "File backup có FSRS state lỗi.".to_string())?;
         }
         transaction.execute(
             "INSERT INTO review_logs(vocabulary_id, rating, elapsed_days, scheduled_days, reviewed_at, state_before_json, state_after_json)
@@ -616,7 +840,11 @@ fn import_into_connection(connection: &Connection, data: ExportData) -> Result<I
         imported_reviews += 1;
     }
     transaction.commit().map_err(|error| error.to_string())?;
-    Ok(ImportResult { imported_words, skipped_words, imported_reviews })
+    Ok(ImportResult {
+        imported_words,
+        skipped_words,
+        imported_reviews,
+    })
 }
 
 #[tauri::command]
@@ -634,8 +862,13 @@ fn import_data(state: State<'_, AppState>, contents: String) -> Result<ImportRes
 }
 
 fn tomorrow_morning() -> Result<DateTime<Utc>, String> {
-    let tomorrow = Local::now().date_naive().succ_opt().ok_or("Không tính được ngày mai.")?;
-    let local_time = tomorrow.and_hms_opt(8, 0, 0).ok_or("Không tính được giờ nhắc.")?;
+    let tomorrow = Local::now()
+        .date_naive()
+        .succ_opt()
+        .ok_or("Không tính được ngày mai.")?;
+    let local_time = tomorrow
+        .and_hms_opt(8, 0, 0)
+        .ok_or("Không tính được giờ nhắc.")?;
     match Local.from_local_datetime(&local_time) {
         LocalResult::Single(time) | LocalResult::Ambiguous(time, _) => Ok(time.with_timezone(&Utc)),
         LocalResult::None => Ok((Utc::now() + Duration::hours(24)).with_timezone(&Utc)),
@@ -648,7 +881,8 @@ fn snooze_reminder(state: State<'_, AppState>, duration: String) -> Result<Strin
         "hour" => Utc::now() + Duration::hours(1),
         "tomorrow" => tomorrow_morning()?,
         _ => return Err("Kiểu hoãn không hợp lệ.".into()),
-    }.to_rfc3339();
+    }
+    .to_rfc3339();
     let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
     upsert_setting(&connection, "reminder_snoozed_until", &until)?;
     drop(connection);
@@ -677,25 +911,50 @@ fn rate_review(state: State<'_, AppState>, card_id: i64, rating: u8) -> Result<S
         return Err("Rating không hợp lệ.".into());
     }
     let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
-    let transaction = connection.unchecked_transaction().map_err(|error| error.to_string())?;
-    let row: (Option<f32>, Option<f32>, Option<String>) = transaction.query_row(
-        "SELECT stability, difficulty, last_reviewed_at FROM vocabulary WHERE id = ?1", [card_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    ).map_err(|_| "Không tìm thấy thẻ.".to_string())?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let row: (Option<f32>, Option<f32>, Option<String>) = transaction
+        .query_row(
+            "SELECT stability, difficulty, last_reviewed_at FROM vocabulary WHERE id = ?1",
+            [card_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| "Không tìm thấy thẻ.".to_string())?;
     let previous = match (row.0, row.1) {
-        (Some(stability), Some(difficulty)) => Some(MemoryState { stability, difficulty }),
+        (Some(stability), Some(difficulty)) => Some(MemoryState {
+            stability,
+            difficulty,
+        }),
         _ => None,
     };
-    let elapsed_days = row.2.as_deref().and_then(|value| parse_due(value).ok())
-        .map(|value| (Utc::now() - value).num_days().max(0) as u32).unwrap_or(0);
-    let desired_retention: f32 = setting(&transaction, "desired_retention")?.parse().unwrap_or(0.9);
-    let states = FSRS::default().next_states(previous, desired_retention, elapsed_days).map_err(|error| error.to_string())?;
-    let next = match rating { 1 => states.again, 2 => states.hard, 3 => states.good, 4 => states.easy, _ => unreachable!() };
+    let elapsed_days = row
+        .2
+        .as_deref()
+        .and_then(|value| parse_due(value).ok())
+        .map(|value| (Utc::now() - value).num_days().max(0) as u32)
+        .unwrap_or(0);
+    let desired_retention: f32 = setting(&transaction, "desired_retention")?
+        .parse()
+        .unwrap_or(0.9);
+    let states = FSRS::default()
+        .next_states(previous, desired_retention, elapsed_days)
+        .map_err(|error| error.to_string())?;
+    let next = match rating {
+        1 => states.again,
+        2 => states.hard,
+        3 => states.good,
+        4 => states.easy,
+        _ => unreachable!(),
+    };
     let scheduled_days = next.interval.round().max(1.0) as i64;
     let reviewed_at = now();
     let due_at = (Utc::now() + Duration::days(scheduled_days)).to_rfc3339();
-    let before = previous.map(|state| json!({"stability": state.stability, "difficulty": state.difficulty}).to_string());
-    let after = json!({"stability": next.memory.stability, "difficulty": next.memory.difficulty}).to_string();
+    let before = previous.map(|state| {
+        json!({"stability": state.stability, "difficulty": state.difficulty}).to_string()
+    });
+    let after = json!({"stability": next.memory.stability, "difficulty": next.memory.difficulty})
+        .to_string();
     transaction.execute(
         "INSERT INTO review_logs(vocabulary_id, rating, elapsed_days, scheduled_days, reviewed_at, state_before_json, state_after_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -714,42 +973,98 @@ fn rate_review(state: State<'_, AppState>, card_id: i64, rating: u8) -> Result<S
 async fn ai_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let (endpoint, enabled) = {
         let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
-        (setting(&connection, "endpoint")?, setting(&connection, "ai_enabled")? == "true")
+        (
+            setting(&connection, "endpoint")?,
+            setting(&connection, "ai_enabled")? == "true",
+        )
     };
-    if !enabled { return Ok(Vec::new()); }
+    if !enabled {
+        return Ok(Vec::new());
+    }
     let mut request = state.http.get(format!("{endpoint}/models"));
-    if let Some(key) = api_key()? { request = request.bearer_auth(key); }
-    let body: Value = request.send().await.map_err(|error| format!("Không kết nối được 9Router: {error}"))?
-        .error_for_status().map_err(|error| format!("9Router lỗi: {error}"))?
-        .json().await.map_err(|error| format!("9Router trả response lỗi: {error}"))?;
-    Ok(body["data"].as_array().into_iter().flatten().filter_map(|item| item["id"].as_str()).map(str::to_owned).collect())
+    if let Some(key) = api_key()? {
+        request = request.bearer_auth(key);
+    }
+    let body: Value = request
+        .send()
+        .await
+        .map_err(|error| format!("Không kết nối được 9Router: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("9Router lỗi: {error}"))?
+        .json()
+        .await
+        .map_err(|error| format!("9Router trả response lỗi: {error}"))?;
+    Ok(body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["id"].as_str())
+        .map(str::to_owned)
+        .collect())
 }
 
 #[tauri::command]
-async fn generate_content(state: State<'_, AppState>, input: GenerateInput) -> Result<GeneratedContent, String> {
+async fn generate_content(
+    state: State<'_, AppState>,
+    input: GenerateInput,
+) -> Result<GeneratedContent, String> {
     let (_, term) = normalize_term(&input.term)?;
     let (endpoint, model, enabled) = {
         let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
-        (setting(&connection, "endpoint")?, setting(&connection, "model")?, setting(&connection, "ai_enabled")? == "true")
+        (
+            setting(&connection, "endpoint")?,
+            setting(&connection, "model")?,
+            setting(&connection, "ai_enabled")? == "true",
+        )
     };
-    if !enabled { return Err("AI đang tắt trong Settings.".into()); }
-    if model.is_empty() { return Err("Chọn model 9Router trong Settings trước.".into()); }
-    let known_translation = input.translation.filter(|value| !value.trim().is_empty()).map(|value| value.trim().to_owned());
-    let prompt = format!("You help a Vietnamese learner learn English. For the term {term:?}{} return only one JSON object with keys translation, example, exercise. translation: concise Vietnamese meaning. example: natural English sentence at B1 level. exercise: one short cloze question. No markdown.", known_translation.map(|value| format!(" (known Vietnamese meaning: {value:?})")).unwrap_or_default());
-    let mut request = state.http.post(format!("{endpoint}/chat/completions")).json(&json!({
-        "model": model,
-        "stream": false,
-        "response_format": {"type": "json_object"},
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 300
-    }));
-    if let Some(key) = api_key()? { request = request.bearer_auth(key); }
-    let response: Value = request.send().await.map_err(|error| format!("Không kết nối được 9Router: {error}"))?
-        .error_for_status().map_err(|error| format!("9Router lỗi: {error}"))?
-        .json().await.map_err(|error| format!("9Router trả response lỗi: {error}"))?;
-    let content = response["choices"][0]["message"]["content"].as_str().ok_or("9Router không trả nội dung.")?;
-    let generated: GeneratedContent = serde_json::from_str(content).map_err(|_| "Model trả JSON không hợp lệ. Hãy thử model khác hoặc nhập tay.".to_string())?;
-    if generated.translation.trim().is_empty() || generated.example.trim().is_empty() || generated.exercise.trim().is_empty() {
+    if !enabled {
+        return Err("AI đang tắt trong Settings.".into());
+    }
+    if model.is_empty() {
+        return Err("Chọn model 9Router trong Settings trước.".into());
+    }
+    let known_translation = input
+        .translation
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_owned());
+    let prompt = format!(
+        "You help a Vietnamese learner learn English. For the term {term:?}{} return only one JSON object with keys translation, example, exercise. translation: concise Vietnamese meaning. example: natural English sentence at B1 level. exercise: one short cloze question. No markdown.",
+        known_translation
+            .map(|value| format!(" (known Vietnamese meaning: {value:?})"))
+            .unwrap_or_default()
+    );
+    let mut request = state
+        .http
+        .post(format!("{endpoint}/chat/completions"))
+        .json(&json!({
+            "model": model,
+            "stream": false,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 300
+        }));
+    if let Some(key) = api_key()? {
+        request = request.bearer_auth(key);
+    }
+    let response: Value = request
+        .send()
+        .await
+        .map_err(|error| format!("Không kết nối được 9Router: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("9Router lỗi: {error}"))?
+        .json()
+        .await
+        .map_err(|error| format!("9Router trả response lỗi: {error}"))?;
+    let content = response["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or("9Router không trả nội dung.")?;
+    let generated: GeneratedContent = serde_json::from_str(content).map_err(|_| {
+        "Model trả JSON không hợp lệ. Hãy thử model khác hoặc nhập tay.".to_string()
+    })?;
+    if generated.translation.trim().is_empty()
+        || generated.example.trim().is_empty()
+        || generated.exercise.trim().is_empty()
+    {
         return Err("Model trả nội dung thiếu trường bắt buộc.".into());
     }
     Ok(generated)
@@ -765,9 +1080,30 @@ fn toggle_passthrough(app: AppHandle, state: State<'_, AppState>) -> Result<bool
     Ok(next)
 }
 
+#[tauri::command]
+fn set_window_mode(app: AppHandle, state: State<'_, AppState>, mode: String) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or("Pet window unavailable")?;
+    let (width, height) = match mode.as_str() {
+        "capture" | "review" => (460.0, 620.0),
+        "settings" => (580.0, 800.0),
+        "pet" => {
+            let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
+            pet_dimensions(&setting(&connection, "pet_size").unwrap_or_else(|_| "medium".into()))
+        }
+        _ => return Err("Chế độ cửa sổ không hợp lệ.".into()),
+    };
+    fit_window(&window, width, height)
+}
+
 fn set_passthrough(app: &AppHandle, enabled: bool) -> Result<(), String> {
-    let window = app.get_webview_window("main").ok_or("Pet window unavailable")?;
-    window.set_ignore_cursor_events(enabled).map_err(|error| error.to_string())
+    let window = app
+        .get_webview_window("main")
+        .ok_or("Pet window unavailable")?;
+    window
+        .set_ignore_cursor_events(enabled)
+        .map_err(|error| error.to_string())
 }
 
 fn show_pet(app: &AppHandle) {
@@ -781,7 +1117,13 @@ fn show_pet(app: &AppHandle) {
 fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let review = MenuItem::with_id(app, "review", "Ôn từ đến hạn", true, None::<&str>)?;
     let capture = MenuItem::with_id(app, "capture", "Thêm từ từ clipboard", true, Some(HOTKEY))?;
-    let passthrough = MenuItem::with_id(app, "passthrough", "Bật/tắt click xuyên pet", true, None::<&str>)?;
+    let passthrough = MenuItem::with_id(
+        app,
+        "passthrough",
+        "Bật/tắt click xuyên pet",
+        true,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "Thoát", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&review, &capture, &passthrough, &quit])?;
     TrayIconBuilder::with_id("tray")
@@ -789,9 +1131,19 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .menu(&menu)
         .tooltip("English Pet")
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "review" => { let _ = app.emit("open-review", ()); show_pet(app); }
-            "capture" => { let _ = app.emit("capture-clipboard", ()); show_pet(app); }
-            "passthrough" => { if let Ok(state) = app.try_state::<AppState>().ok_or(()) { let _ = toggle_passthrough(app.clone(), state); } }
+            "review" => {
+                let _ = app.emit("open-review", ());
+                show_pet(app);
+            }
+            "capture" => {
+                let _ = app.emit("capture-clipboard", ());
+                show_pet(app);
+            }
+            "passthrough" => {
+                if let Ok(state) = app.try_state::<AppState>().ok_or(()) {
+                    let _ = toggle_passthrough(app.clone(), state);
+                }
+            }
             "quit" => app.exit(0),
             _ => {}
         })
@@ -804,10 +1156,14 @@ pub fn run() {
     let context = tauri::generate_context!();
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_shortcut(HOTKEY).expect("valid hotkey")
+                .with_shortcut(HOTKEY)
+                .expect("valid hotkey")
                 .with_handler(|app, _, event| {
                     if event.state == ShortcutState::Pressed {
                         let _ = app.emit("capture-clipboard", ());
@@ -817,26 +1173,65 @@ pub fn run() {
                 .build(),
         )
         .setup(move |app| {
-            let db_path = app_db_path(app.handle()).map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            let db_path = app_db_path(app.handle())
+                .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
             let connection = Connection::open(db_path)?;
-            initialize_db(&connection).map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            initialize_db(&connection)
+                .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
             let (reminder_tx, reminder_rx) = mpsc::channel();
             app.manage(AppState {
                 db: Mutex::new(connection),
-                http: Client::builder().timeout(StdDuration::from_secs(20)).build()?,
+                http: Client::builder()
+                    .timeout(StdDuration::from_secs(20))
+                    .build()?,
                 reminder_tx,
             });
             setup_tray(app.handle())?;
-            let passthrough = app.state::<AppState>().db.lock().ok().and_then(|db| setting(&db, "pet_passthrough").ok()).is_some_and(|value| value == "true");
-            if passthrough { let _ = set_passthrough(app.handle(), true); }
+            let (passthrough, pet_size) = app
+                .state::<AppState>()
+                .db
+                .lock()
+                .ok()
+                .map(|db| {
+                    (
+                        setting(&db, "pet_passthrough").is_ok_and(|value| value == "true"),
+                        setting(&db, "pet_size").unwrap_or_else(|_| "medium".into()),
+                    )
+                })
+                .unwrap_or((false, "medium".into()));
+            if let Some(window) = app.get_webview_window("main") {
+                let (width, height) = pet_dimensions(&pet_size);
+                let _ = fit_window(&window, width, height);
+            }
+            if passthrough {
+                let _ = set_passthrough(app.handle(), true);
+            }
             start_reminder_scheduler(app.handle().clone(), reminder_rx);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![dashboard, get_settings, save_settings, capture_clipboard, save_word, export_data, backup_sqlite, import_data, snooze_reminder, next_review, rate_review, ai_models, generate_content, toggle_passthrough])
+        .invoke_handler(tauri::generate_handler![
+            dashboard,
+            get_settings,
+            save_settings,
+            capture_clipboard,
+            save_word,
+            export_data,
+            backup_sqlite,
+            import_data,
+            snooze_reminder,
+            next_review,
+            rate_review,
+            ai_models,
+            generate_content,
+            toggle_passthrough,
+            set_window_mode
+        ])
         .build(context)
         .expect("error while building Tauri application")
         .run(|app, event| {
-            if let RunEvent::ExitRequested { .. } = event { app.exit(0); }
+            if let RunEvent::ExitRequested { .. } = event {
+                app.exit(0);
+            }
         });
 }
 
@@ -846,7 +1241,10 @@ mod tests {
 
     #[test]
     fn normalizes_one_short_phrase() {
-        assert_eq!(normalize_term("  take\tcare  ").unwrap(), ("take care".into(), "take care".into()));
+        assert_eq!(
+            normalize_term("  take\tcare  ").unwrap(),
+            ("take care".into(), "take care".into())
+        );
         assert!(normalize_term("\n").is_err());
     }
 
@@ -885,25 +1283,47 @@ mod tests {
 
         let destination = Connection::open_in_memory().unwrap();
         initialize_db(&destination).unwrap();
-        let result = import_into_connection(&destination, export_from_connection(&source).unwrap()).unwrap();
+        let result =
+            import_into_connection(&destination, export_from_connection(&source).unwrap()).unwrap();
 
         assert_eq!(result.imported_words, 1);
         assert_eq!(result.imported_reviews, 1);
-        assert_eq!(destination.query_row("SELECT COUNT(*) FROM vocabulary", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-        assert_eq!(destination.query_row("SELECT COUNT(*) FROM review_logs", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            destination
+                .query_row("SELECT COUNT(*) FROM vocabulary", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            destination
+                .query_row("SELECT COUNT(*) FROM review_logs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
     fn import_rejects_unknown_version_without_writing() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_db(&connection).unwrap();
-        let result = import_into_connection(&connection, ExportData {
-            version: 2,
-            exported_at: now(),
-            vocabulary: Vec::new(),
-            review_logs: Vec::new(),
-        });
+        let result = import_into_connection(
+            &connection,
+            ExportData {
+                version: 2,
+                exported_at: now(),
+                vocabulary: Vec::new(),
+                review_logs: Vec::new(),
+            },
+        );
         assert!(result.is_err());
-        assert_eq!(connection.query_row("SELECT COUNT(*) FROM vocabulary", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM vocabulary", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 }

@@ -1,6 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { LogicalSize } from '@tauri-apps/api/dpi'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
@@ -28,6 +27,8 @@ type Settings = {
   quietHoursStart: number
   quietHoursEnd: number
   petPassthrough: boolean
+  petSize: 'small' | 'medium' | 'large'
+  petOpacity: number
   aiEnabled: boolean
   autostart: boolean
   hasApiKey: boolean
@@ -38,7 +39,7 @@ type Modal = 'capture' | 'review' | 'settings' | null
 
 const initialSettings: Settings = {
   endpoint: 'http://localhost:20128/v1', model: '', desiredRetention: 0.9,
-  quietHoursStart: 22, quietHoursEnd: 8, petPassthrough: false, aiEnabled: true, autostart: false, hasApiKey: false,
+  quietHoursStart: 22, quietHoursEnd: 8, petPassthrough: false, petSize: 'medium', petOpacity: 1, aiEnabled: true, autostart: false, hasApiKey: false,
 }
 
 function App() {
@@ -86,8 +87,7 @@ function App() {
   }
 
   useEffect(() => {
-    const [width, height] = modal === 'settings' ? [580, 800] : modal ? [460, 620] : [220, 248]
-    void getCurrentWindow().setSize(new LogicalSize(width, height))
+    void invoke('set_window_mode', { mode: modal ?? 'pet' }).catch((error) => notify(String(error)))
   }, [modal])
 
   useEffect(() => {
@@ -189,6 +189,8 @@ function App() {
     <section
       ref={petRef}
       className={`pet-shell ${dragging ? 'is-dragging' : ''} ${reminding ? 'is-reminding' : ''}`}
+      data-size={settings.petSize}
+      style={{ '--pet-opacity': settings.petOpacity } as React.CSSProperties}
       onPointerDown={dragWindow}
       onDragEnter={(event) => { event.preventDefault(); setDragging(true) }}
       onDragOver={(event) => event.preventDefault()}
@@ -249,6 +251,8 @@ function App() {
       <Field label="Model"><div className="inline"><input value={settings.model} list="models" onChange={(event) => setSettings({ ...settings, model: event.target.value })} placeholder="Chọn hoặc nhập model ID" /><button className="secondary" disabled={busy} onClick={() => void loadModels()}>Tải models</button></div><datalist id="models">{models.map((model) => <option value={model} key={model} />)}</datalist></Field>
       <Field label="9Router API key"><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={settings.hasApiKey ? 'Đã lưu an toàn. Nhập để thay hoặc xóa.' : 'Tùy chọn, chỉ nếu 9Router yêu cầu'} /></Field>
       <div className="setting-grid"><Field label="Desired retention"><input type="number" min="0.8" max="0.98" step="0.01" value={settings.desiredRetention} onChange={(event) => setSettings({ ...settings, desiredRetention: Number(event.target.value) })} /></Field><Field label="Giờ yên lặng từ"><input type="number" min="0" max="23" value={settings.quietHoursStart} onChange={(event) => setSettings({ ...settings, quietHoursStart: Number(event.target.value) })} /></Field><Field label="đến"><input type="number" min="0" max="23" value={settings.quietHoursEnd} onChange={(event) => setSettings({ ...settings, quietHoursEnd: Number(event.target.value) })} /></Field></div>
+      <Field label="Kích thước pet"><select value={settings.petSize} onChange={(event) => setSettings({ ...settings, petSize: event.target.value as Settings['petSize'] })}><option value="small">Nhỏ</option><option value="medium">Vừa</option><option value="large">Lớn</option></select></Field>
+      <Field label={`Độ trong suốt pet: ${Math.round(settings.petOpacity * 100)}%`}><input type="range" min="0.2" max="1" step="0.05" value={settings.petOpacity} onChange={(event) => setSettings({ ...settings, petOpacity: Number(event.target.value) })} /></Field>
       <label className="check"><input type="checkbox" checked={settings.aiEnabled} onChange={(event) => setSettings({ ...settings, aiEnabled: event.target.checked })} /> Cho phép gửi từ đang thêm tới 9Router khi bấm “Tạo bằng AI”</label>
       <label className="check"><input type="checkbox" checked={settings.petPassthrough} onChange={(event) => setSettings({ ...settings, petPassthrough: event.target.checked })} /> Click xuyên pet (mở tray để bật lại tương tác)</label>
       <label className="check"><input type="checkbox" checked={settings.autostart} onChange={(event) => setSettings({ ...settings, autostart: event.target.checked })} /> Mở English Pet khi đăng nhập Windows</label>
