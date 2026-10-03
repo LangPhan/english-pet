@@ -1,0 +1,60 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "English Pet",
+  "version": "0.1.0",
+  "identifier": "com.englishpet.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "English Pet",
+        "width": 220,
+        "height": 248,
+        "resizable": false,
+        "fullscreen": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "category": "Education",
+    "shortDescription": "Desktop pet for English spaced repetition.",
+    "longDescription": "A lightweight local-first English vocabulary pet with FSRS review scheduling.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "allowDowngrades": false,
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English"],
+        "displayLanguageSelector": false,
+        "compression": "lzma",
+        "startMenuFolder": "English Pet"
+      }
+    }
+  }
+}
