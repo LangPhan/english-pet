@@ -5,6 +5,11 @@
 body { margin: 0; min-height: 100vh; overflow: hidden; background: transparent; }
 button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
+.dialog { scrollbar-width: thin; scrollbar-color: #d7b9a4 transparent; }
+.dialog::-webkit-scrollbar { width: 7px; }
+.dialog::-webkit-scrollbar-track { margin: 16px 0; background: transparent; }
+.dialog::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 999px; background: #d7b9a4; background-clip: padding-box; }
+.dialog::-webkit-scrollbar-thumb:hover { background-color: #bd947d; }
 .app { min-height: 100vh; }
 .pet-shell { --pet-scale: 1; position: fixed; right: 0; bottom: 0; width: 280px; height: 280px; user-select: none; touch-action: none; opacity: var(--pet-opacity, 1); transform: scale(var(--pet-scale)); transform-origin: bottom right; }
 .pet-shell[data-size="small"] { --pet-scale: .8; }.pet-shell[data-size="large"] { --pet-scale: 1.25; }
