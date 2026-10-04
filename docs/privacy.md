@@ -4,13 +4,13 @@ English Pet stores vocabulary, FSRS state, and review logs in SQLite under Windo
 
 ## Clipboard
 
-English Pet reads clipboard text only after user explicitly presses `Ctrl+Shift+E` or chooses **Thêm từ từ clipboard** in tray. It does not watch clipboard continuously, inspect selected text, or record keystrokes.
+English Pet reads clipboard text only after user explicitly presses `Ctrl+Shift+E`, clicks **+ Từ**, or chooses **Thêm từ từ clipboard** in tray. It animates that text on a bone into Corgi, then saves it locally in Inbox as **Chờ định nghĩa**. It does not watch clipboard continuously, inspect selected text, or record keystrokes.
 
 ## AI and 9Router
 
-AI is optional. Pressing **Tạo bằng AI** sends only current term and optional meaning to configured 9Router endpoint, then returns example, exercise, and one fixed topic. The default is local `http://localhost:20128/v1`.
+AI is optional. Pressing **Tạo bằng AI** for one Inbox word sends only that term and optional meaning to configured 9Router endpoint, then returns meaning, example, exercise, and one fixed topic. The default is local `http://localhost:20128/v1`.
 
-Viewing, searching, and filtering the local vocabulary Inbox never sends data over the network. **Phân loại AI** only sends the explicitly confirmed unclassified terms currently shown in Inbox; it never runs automatically or sends review logs, statistics, or the full database.
+Viewing, searching, and filtering the local vocabulary Inbox never sends data over the network. **Định nghĩa AI** only sends the explicitly confirmed pending terms currently shown in Inbox; it returns meaning, example, and fixed topic. It never runs automatically or sends review logs, statistics, or the full database. Pending words do not enter review reminders until they have a Vietnamese meaning.
 
 Do not use a remote endpoint unless you accept its operator and downstream AI providers may process that content. 9Router controls its own request logging and provider configuration; check its settings before use.
 

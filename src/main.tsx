@@ -37,9 +37,10 @@ type Settings = {
 type Generated = { translation: string; example: string; exercise: string; topic: Topic }
 type Topic = 'daily_life' | 'work_tech' | 'study_academic' | 'travel_places' | 'food_dining' | 'health_sports' | 'entertainment' | 'emotions_social' | 'other'
 type TopicFilter = Topic | 'unclassified' | ''
-type VocabularyItem = { id: number; term: string; translation: string | null; topic: Topic | null; dueAt: string; createdAt: string }
+type VocabularyItem = { id: number; term: string; translation: string | null; example: string | null; topic: Topic | null; dueAt: string; createdAt: string }
 type VocabularyPage = { items: VocabularyItem[]; total: number; unclassifiedCount: number }
-type Modal = 'capture' | 'review' | 'settings' | 'inbox' | null
+type FeedPhase = 'flying' | 'chewing' | 'happy' | null
+type Modal = 'review' | 'settings' | 'inbox' | 'edit' | null
 
 const topics: Record<Topic, string> = {
   daily_life: 'Đời sống', work_tech: 'Công việc & Công nghệ', study_academic: 'Học tập', travel_places: 'Du lịch', food_dining: 'Ẩm thực',
@@ -59,6 +60,9 @@ function App() {
   const [example, setExample] = useState('')
   const [exercise, setExercise] = useState('')
   const [topic, setTopic] = useState<Topic | ''>('')
+  const [editingWord, setEditingWord] = useState<VocabularyItem | null>(null)
+  const [feedingWord, setFeedingWord] = useState<string | null>(null)
+  const [feedPhase, setFeedPhase] = useState<FeedPhase>(null)
   const [review, setReview] = useState<ReviewCard | null>(null)
   const [vocabulary, setVocabulary] = useState<VocabularyPage>({ items: [], total: 0, unclassifiedCount: 0 })
   const [search, setSearch] = useState('')
@@ -83,12 +87,26 @@ function App() {
   const refresh = async () => {
     try { setDashboard(await api<Dashboard>('dashboard')) } catch (error) { notify(String(error)) }
   }
-  const openCapture = async (clipboard = false) => {
-    setTerm(''); setTranslation(''); setExample(''); setExercise(''); setTopic('')
-    if (clipboard) {
-      try { setTerm(await api<string>('capture_clipboard')) } catch (error) { notify(String(error)) }
-    }
-    setModal('capture')
+  const feedWord = async (rawTerm?: string) => {
+    if (feedingWord) return
+    try {
+      const capturedTerm = rawTerm?.trim() || await api<string>('capture_clipboard')
+      if (!capturedTerm) return
+      setFeedingWord(capturedTerm); setFeedPhase('flying')
+      window.setTimeout(async () => {
+        setFeedPhase('chewing')
+        try {
+          await api('save_word', { input: { term: capturedTerm, translation: null, example: null, topic: null } })
+          setFeedPhase('happy'); await refresh(); notify('Corgi đã nuốt từ mới. Mở Inbox để định nghĩa.')
+        } catch (error) {
+          notify(String(error)); setFeedPhase(null); setFeedingWord(null); return
+        }
+        window.setTimeout(() => { setFeedPhase(null); setFeedingWord(null) }, 550)
+      }, 450)
+    } catch (error) { notify(String(error)) }
+  }
+  const openEdit = (word: VocabularyItem) => {
+    setEditingWord(word); setTerm(word.term); setTranslation(word.translation || ''); setExample(word.example || ''); setExercise(''); setTopic(word.topic || ''); setModal('edit')
   }
   const openReview = async () => {
     try {
@@ -117,7 +135,7 @@ function App() {
   useEffect(() => {
     void refresh()
     const unlisten = Promise.all([
-      listen('capture-clipboard', () => void openCapture(true)),
+      listen('capture-clipboard', () => void feedWord()),
       listen('open-review', () => void openReview()),
       listen<number>('review-reminder', () => {
         setReminding(true)
@@ -133,17 +151,18 @@ function App() {
     setDragging(false)
     const dropped = event.dataTransfer.getData('text/plain').trim()
     if (!dropped) { notify('Không nhận được text. Copy từ rồi bấm Ctrl+Shift+E.'); return }
-    setTerm(dropped); setTranslation(''); setExample(''); setExercise(''); setTopic(''); setModal('capture')
+    void feedWord(dropped)
   }
   const dragWindow = (event: React.PointerEvent) => {
-    if ((event.target as HTMLElement).closest('button, input, textarea, select, .mouth')) return
+    if ((event.target as HTMLElement).closest('button, input, textarea, select')) return
     void getCurrentWindow().startDragging()
   }
   const saveWord = async () => {
+    if (!editingWord) return
     setBusy(true)
     try {
-      await api('save_word', { input: { term, translation, example, topic: topic || null } })
-      setModal(null); await refresh(); notify('Pet đã nuốt từ mới.')
+      await api('update_word', { input: { id: editingWord.id, translation, example: example || null, topic: topic || null } })
+      setModal('inbox'); await loadVocabulary(); await refresh(); notify('Đã định nghĩa từ.')
     } catch (error) { notify(String(error)) } finally { setBusy(false) }
   }
   const generate = async () => {
@@ -151,6 +170,14 @@ function App() {
     try {
       const content = await api<Generated>('generate_content', { input: { term, translation: translation || null } })
       setTranslation(content.translation); setExample(content.example); setExercise(content.exercise); setTopic(content.topic)
+    } catch (error) { notify(String(error)) } finally { setBusy(false) }
+  }
+  const defineWithAi = async (word: VocabularyItem) => {
+    setBusy(true)
+    try {
+      const content = await api<Generated>('generate_content', { input: { term: word.term, translation: word.translation || null } })
+      await api('update_word', { input: { id: word.id, translation: content.translation, example: content.example, topic: content.topic } })
+      await loadVocabulary(); await refresh(); notify(`AI đã định nghĩa “${word.term}”.`)
     } catch (error) { notify(String(error)) } finally { setBusy(false) }
   }
   const rate = async (rating: number) => {
@@ -207,15 +234,15 @@ function App() {
       notify(`Đã import ${result.importedWords} từ, ${result.importedReviews} lượt ôn; bỏ qua ${result.skippedWords} từ trùng.`)
     } catch (error) { notify(String(error)) } finally { setBusy(false) }
   }
-  const categorizeUnclassified = async () => {
-    const ids = vocabulary.items.filter((word) => !word.topic).map((word) => word.id)
+  const definePendingWithAi = async () => {
+    const ids = vocabulary.items.filter((word) => !word.translation).map((word) => word.id)
     if (!ids.length) return
-    if (!window.confirm(`Gửi ${ids.length} từ chưa phân loại tới ${settings.endpoint} để AI chọn chủ đề? Chỉ các từ này được gửi.`)) return
+    if (!window.confirm(`Gửi ${ids.length} từ chờ định nghĩa tới ${settings.endpoint} để AI tạo nghĩa, ví dụ và chủ đề? Chỉ các từ này được gửi.`)) return
     setBusy(true)
     try {
-      const result = await api<{ updatedCount: number; failedCount: number }>('batch_categorize_vocabulary', { input: { ids } })
-      await loadVocabulary()
-      notify(`Đã phân loại ${result.updatedCount} từ${result.failedCount ? `; ${result.failedCount} từ chưa xong` : ''}.`)
+      const result = await api<{ updatedCount: number; failedCount: number }>('batch_define_vocabulary', { input: { ids } })
+      await loadVocabulary(); await refresh()
+      notify(`AI đã định nghĩa ${result.updatedCount} từ${result.failedCount ? `; ${result.failedCount} từ chưa xong` : ''}.`)
     } catch (error) { notify(String(error)) } finally { setBusy(false) }
   }
   const petLabel = useMemo(() => dashboard.dueCount > 0 ? `${dashboard.dueCount} từ chờ ôn` : 'Inbox trống', [dashboard.dueCount])
@@ -223,7 +250,7 @@ function App() {
   return <main className="app" aria-live="polite">
     <section
       ref={petRef}
-      className={`pet-shell ${dragging ? 'is-dragging' : ''} ${reminding ? 'is-reminding' : ''}`}
+      className={`pet-shell ${dragging ? 'is-dragging' : ''} ${reminding ? 'is-reminding' : ''} ${feedPhase ? `is-${feedPhase}` : ''}`}
       data-size={settings.petSize}
       style={{ '--pet-opacity': settings.petOpacity } as React.CSSProperties}
       onPointerDown={dragWindow}
@@ -235,16 +262,16 @@ function App() {
     >
       <div className="speech" role="status">
         <strong>{petLabel}</strong>
-        <span>{dashboard.dueCount > 0 ? 'Bấm để ôn 1 phút' : 'Kéo từ vào miệng nhé'}</span>
+        <span>{dashboard.dueCount > 0 ? 'Bấm để ôn 1 phút' : 'Copy từ rồi bấm Ctrl + Shift + E'}</span>
       </div>
-      <div className="pet" onDoubleClick={() => void openReview()}>
+      {feedingWord && <span className="bone" aria-hidden="true"><span>{feedingWord}</span></span>}
+      <button className="pet corgi" aria-label="Ôn từ đến hạn" onClick={() => void openReview()}>
         <span className="ear ear-left" /><span className="ear ear-right" />
-        <span className="eye eye-left" /><span className="eye eye-right" />
-        <button className="mouth" title="Thêm từ từ clipboard" aria-label="Thêm từ từ clipboard" onClick={() => void openCapture(true)}>
-          <span className="tongue" />
-        </button>
+        <span className="blaze" /><span className="eye eye-left" /><span className="eye eye-right" />
+        <span className="muzzle" /><span className="nose" />
+        <span className="mouth"><span className="tongue" /></span>
         <span className="cheek cheek-left" /><span className="cheek cheek-right" />
-      </div>
+      </button>
       {reminding && <div className="reminder-actions" aria-label="Hoãn nhắc ôn">
         <button onClick={() => void openReview()}>Ôn ngay</button>
         <button onClick={() => void snooze('hour')}>1 giờ</button>
@@ -252,7 +279,7 @@ function App() {
       </div>}
       <nav className="pet-actions" aria-label="Pet actions">
         <button onClick={() => void openReview()}>Ôn</button>
-        <button onClick={() => void openCapture(true)}>+ Từ</button>
+        <button disabled={Boolean(feedingWord)} onClick={() => void feedWord()}>+ Từ</button>
         <button onClick={() => void openInbox()} aria-label="Xem từ đã thêm">Từ</button>
         <button onClick={() => void openSettings()} aria-label="Settings">⚙</button>
         <button onClick={() => void togglePassthrough()} title="Bật/tắt click xuyên">◎</button>
@@ -260,20 +287,18 @@ function App() {
     </section>
 
     {message && <div className="toast" role="alert">{message}</div>}
-    {modal === 'capture' && <Dialog title="Nuôi pet bằng từ mới" onClose={() => setModal(null)}>
-      <p className="hint">Kéo text vào miệng pet, hoặc copy text rồi bấm <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>E</kbd>.</p>
-      <Field label="Từ hoặc cụm từ"><input autoFocus value={term} onChange={(event) => setTerm(event.target.value)} placeholder="take care" maxLength={100} /></Field>
-      <Field label="Nghĩa tiếng Việt"><input value={translation} onChange={(event) => setTranslation(event.target.value)} placeholder="chăm sóc" /></Field>
-      <Field label="Ví dụ"><textarea value={example} onChange={(event) => setExample(event.target.value)} placeholder="Please take care of yourself." rows={3} /></Field>
+    {modal === 'edit' && editingWord && <Dialog title={`Định nghĩa: ${editingWord.term}`} onClose={() => setModal('inbox')}>
+      <Field label="Nghĩa tiếng Việt"><input autoFocus value={translation} onChange={(event) => setTranslation(event.target.value)} placeholder="chăm sóc" maxLength={2000} /></Field>
+      <Field label="Ví dụ"><textarea value={example} onChange={(event) => setExample(event.target.value)} placeholder="Please take care of yourself." rows={3} maxLength={5000} /></Field>
       <Field label="Chủ đề"><select value={topic} onChange={(event) => setTopic(event.target.value as Topic | '')}><option value="">Chưa phân loại</option>{Object.entries(topics).map(([id, label]) => <option value={id} key={id}>{label}</option>)}</select></Field>
       {exercise && <p className="exercise"><b>Bài tập AI:</b> {exercise}</p>}
-      <footer><button className="secondary" disabled={!term || busy} onClick={() => void generate()}>✨ Tạo bằng AI</button><button className="primary" disabled={!term || busy} onClick={() => void saveWord()}>{busy ? 'Đang lưu…' : 'Cho pet ăn'}</button></footer>
+      <footer><button className="secondary" disabled={busy} onClick={() => void generate()}>✨ Tạo bằng AI</button><button className="primary" disabled={!translation.trim() || busy} onClick={() => void saveWord()}>{busy ? 'Đang lưu…' : 'Lưu định nghĩa'}</button></footer>
     </Dialog>}
 
     {modal === 'review' && <Dialog title="Ôn cùng pet" onClose={() => setModal(null)}>
       {!review ? <div className="empty"><span>✦</span><h2>Hết từ đến hạn</h2><p>Pet nghỉ một chút. Thêm từ mới hoặc quay lại sau.</p></div> : <article className="review-card">
         <small>English → Vietnamese</small><h1>{review.term}</h1>
-        {showMeaning ? <><p className="meaning">{review.translation || 'Chưa có nghĩa. Chỉnh sửa trong Inbox sau.'}</p>{review.example && <p className="example">“{review.example}”</p>}</> : <button className="reveal" onClick={() => setShowMeaning(true)}>Hiện nghĩa</button>}
+        {showMeaning ? <><p className="meaning">{review.translation}</p>{review.example && <p className="example">“{review.example}”</p>}</> : <button className="reveal" onClick={() => setShowMeaning(true)}>Hiện nghĩa</button>}
         <div className="ratings">
           <button className="again" disabled={busy} onClick={() => void rate(1)}>Again</button>
           <button className="hard" disabled={busy} onClick={() => void rate(2)}>Hard</button>
@@ -286,8 +311,8 @@ function App() {
     {modal === 'inbox' && <Dialog title="Từ vựng đã thêm" onClose={() => setModal(null)} wide>
       <div className="inbox-tools"><input value={search} onChange={(event) => { const value = event.target.value; setSearch(value); void loadVocabulary(value, topicFilter, 0) }} placeholder="Tìm từ hoặc nghĩa" aria-label="Tìm từ hoặc nghĩa" /><select value={topicFilter} onChange={(event) => { const value = event.target.value as TopicFilter; setTopicFilter(value); void loadVocabulary(search, value, 0) }} aria-label="Lọc chủ đề"><option value="">Tất cả chủ đề</option><option value="unclassified">Chưa phân loại</option>{Object.entries(topics).map(([id, label]) => <option value={id} key={id}>{label}</option>)}</select></div>
       <p className="hint">{vocabulary.total} từ · {vocabulary.unclassifiedCount} từ chưa phân loại</p>
-      {vocabulary.items.some((word) => !word.topic) && <button className="secondary" disabled={busy} onClick={() => void categorizeUnclassified()}>✨ Phân loại AI ({vocabulary.items.filter((word) => !word.topic).length} từ đang xem)</button>}
-      <div className="vocabulary-list">{vocabulary.items.map((word) => <article className="vocabulary-row" key={word.id}><div><strong>{word.term}</strong><span>{word.translation || 'Chưa có nghĩa'}</span></div><span className={`topic topic-${word.topic || 'unclassified'}`}>{word.topic ? topics[word.topic] : 'Chưa phân loại'}</span></article>)}</div>
+      {vocabulary.items.some((word) => !word.translation) && <button className="secondary" disabled={busy} onClick={() => void definePendingWithAi()}>✨ Định nghĩa AI ({vocabulary.items.filter((word) => !word.translation).length} từ đang xem)</button>}
+      <div className="vocabulary-list">{vocabulary.items.map((word) => <article className="vocabulary-row" key={word.id}><button className="vocabulary-main" onClick={() => openEdit(word)}><strong>{word.term}</strong><span>{word.translation || 'Chờ định nghĩa'}</span></button><div className="vocabulary-actions">{!word.translation && <button className="secondary small-button" disabled={busy} onClick={() => void defineWithAi(word)}>✨ AI</button>}<span className={`topic ${!word.translation ? 'topic-pending' : `topic-${word.topic || 'unclassified'}`}`}>{!word.translation ? 'Chờ định nghĩa' : word.topic ? topics[word.topic] : 'Chưa phân loại'}</span></div></article>)}</div>
       {!vocabulary.items.length && <div className="empty"><span>✦</span><h2>Chưa có từ phù hợp</h2><p>Thêm từ mới hoặc đổi bộ lọc.</p></div>}
       {vocabulary.total > 50 && <footer><button className="secondary" disabled={busy || vocabularyOffset === 0} onClick={() => void loadVocabulary(search, topicFilter, Math.max(0, vocabularyOffset - 50))}>Trước</button><button className="secondary" disabled={busy || vocabularyOffset + 50 >= vocabulary.total} onClick={() => void loadVocabulary(search, topicFilter, vocabularyOffset + 50)}>Sau</button></footer>}
     </Dialog>}

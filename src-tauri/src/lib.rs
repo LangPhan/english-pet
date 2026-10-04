@@ -75,6 +75,7 @@ struct VocabularyItem {
     id: i64,
     term: String,
     translation: Option<String>,
+    example: Option<String>,
     topic: Option<String>,
     due_at: String,
     created_at: String,
@@ -140,8 +141,17 @@ struct ListVocabularyInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CategorizeVocabularyInput {
+struct BatchDefineVocabularyInput {
     ids: Vec<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateWordInput {
+    id: i64,
+    translation: String,
+    example: Option<String>,
+    topic: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,9 +186,16 @@ struct GeneratedContent {
     topic: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct GeneratedDefinition {
+    translation: String,
+    example: String,
+    topic: String,
+}
+
 #[derive(Debug, Deserialize)]
-struct TopicAssignments {
-    topics: HashMap<String, String>,
+struct DefinitionAssignments {
+    definitions: HashMap<String, GeneratedDefinition>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -483,7 +500,7 @@ fn reminder_action(
     }
     let next_due_at: Option<String> = connection
         .query_row(
-            "SELECT due_at FROM vocabulary ORDER BY due_at LIMIT 1",
+            "SELECT due_at FROM vocabulary WHERE translation IS NOT NULL AND trim(translation) != '' ORDER BY due_at LIMIT 1",
             [],
             |row| row.get(0),
         )
@@ -523,7 +540,7 @@ fn reminder_action(
     }
     let due_count = connection
         .query_row(
-            "SELECT COUNT(*) FROM vocabulary WHERE due_at <= ?1",
+            "SELECT COUNT(*) FROM vocabulary WHERE due_at <= ?1 AND translation IS NOT NULL AND trim(translation) != ''",
             [now()],
             |row| row.get(0),
         )
@@ -574,7 +591,7 @@ fn dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
     let current_time = now();
     let due_count = connection
         .query_row(
-            "SELECT COUNT(*) FROM vocabulary WHERE due_at <= ?1",
+            "SELECT COUNT(*) FROM vocabulary WHERE due_at <= ?1 AND translation IS NOT NULL AND trim(translation) != ''",
             [current_time],
             |row| row.get(0),
         )
@@ -584,7 +601,7 @@ fn dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
         .map_err(|error| error.to_string())?;
     let next_due_at = connection
         .query_row(
-            "SELECT due_at FROM vocabulary ORDER BY due_at LIMIT 1",
+            "SELECT due_at FROM vocabulary WHERE translation IS NOT NULL AND trim(translation) != '' ORDER BY due_at LIMIT 1",
             [],
             |row| row.get(0),
         )
@@ -775,7 +792,7 @@ fn list_vocabulary_from_connection(
         None => "?2 = ''",
     };
     let sql = format!(
-        "SELECT id, term, translation, topic, due_at, created_at FROM vocabulary
+        "SELECT id, term, translation, example, topic, due_at, created_at FROM vocabulary
          WHERE (term LIKE ?1 OR COALESCE(translation, '') LIKE ?1) AND {filter}
          ORDER BY created_at DESC, id DESC LIMIT 50 OFFSET ?3"
     );
@@ -789,9 +806,10 @@ fn list_vocabulary_from_connection(
                 id: row.get(0)?,
                 term: row.get(1)?,
                 translation: row.get(2)?,
-                topic: row.get(3)?,
-                due_at: row.get(4)?,
-                created_at: row.get(5)?,
+                example: row.get(3)?,
+                topic: row.get(4)?,
+                due_at: row.get(5)?,
+                created_at: row.get(6)?,
             })
         })
         .map_err(|error| error.to_string())?
@@ -828,16 +846,76 @@ fn list_vocabulary(
     list_vocabulary_from_connection(&connection, &input)
 }
 
+fn normalize_definition(definition: GeneratedDefinition) -> Result<GeneratedDefinition, String> {
+    let translation = definition.translation.trim().to_owned();
+    let example = definition.example.trim().to_owned();
+    if translation.is_empty()
+        || example.is_empty()
+        || translation.chars().count() > 2_000
+        || example.chars().count() > 5_000
+    {
+        return Err("Model trả nghĩa hoặc ví dụ không hợp lệ.".into());
+    }
+    let topic = validate_topic(Some(definition.topic))?.ok_or("Model trả chủ đề không hợp lệ.")?;
+    Ok(GeneratedDefinition {
+        translation,
+        example,
+        topic,
+    })
+}
+
 #[tauri::command]
-async fn batch_categorize_vocabulary(
+fn update_word(state: State<'_, AppState>, input: UpdateWordInput) -> Result<(), String> {
+    if input.id <= 0 {
+        return Err("ID từ không hợp lệ.".into());
+    }
+    let translation = input.translation.trim().to_owned();
+    if translation.is_empty() || translation.chars().count() > 2_000 {
+        return Err("Nhập nghĩa tiếng Việt, tối đa 2.000 ký tự.".into());
+    }
+    let example = input
+        .example
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if example
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > 5_000)
+    {
+        return Err("Ví dụ tối đa 5.000 ký tự.".into());
+    }
+    let topic = validate_topic(input.topic)?;
+    let timestamp = now();
+    let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
+    let updated = connection
+        .execute(
+            "UPDATE vocabulary
+             SET translation = ?1, example = ?2, topic = ?3,
+                 due_at = CASE WHEN last_reviewed_at IS NULL THEN ?4 ELSE due_at END,
+                 updated_at = ?4
+             WHERE id = ?5",
+            params![translation, example, topic, timestamp, input.id],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated == 0 {
+        return Err("Không tìm thấy từ trong Inbox.".into());
+    }
+    drop(connection);
+    reschedule_reminder(&state);
+    Ok(())
+}
+
+#[tauri::command]
+async fn batch_define_vocabulary(
     state: State<'_, AppState>,
-    input: CategorizeVocabularyInput,
+    input: BatchDefineVocabularyInput,
 ) -> Result<CategorizeResult, String> {
-    let ids = input
+    let mut ids = input
         .ids
         .into_iter()
         .filter(|id| *id > 0)
         .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
     if ids.is_empty() {
         return Ok(CategorizeResult {
             updated_count: 0,
@@ -845,12 +923,12 @@ async fn batch_categorize_vocabulary(
         });
     }
     if ids.len() > 100 {
-        return Err("Mỗi lần chỉ phân loại tối đa 100 từ.".into());
+        return Err("Mỗi lần chỉ định nghĩa tối đa 100 từ.".into());
     }
     let (endpoint, model, enabled, words) = {
         let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
         let mut query = connection
-            .prepare("SELECT id, term FROM vocabulary WHERE id = ?1 AND topic IS NULL")
+            .prepare("SELECT id, term FROM vocabulary WHERE id = ?1 AND (translation IS NULL OR trim(translation) = '')")
             .map_err(|error| error.to_string())?;
         let words = ids
             .iter()
@@ -879,10 +957,10 @@ async fn batch_categorize_vocabulary(
     }
     let mut updated_count = 0;
     let mut failed_count = 0;
-    for chunk in words.chunks(15) {
+    for chunk in words.chunks(10) {
         let terms = chunk.iter().map(|(_, term)| term).collect::<Vec<_>>();
         let prompt = format!(
-            "Classify each English term into exactly one allowed topic ID: {}. Return only JSON object {{\"topics\": {{\"term\": \"topic_id\"}}}}. Terms: {}",
+            "For each English term, return concise Vietnamese translation, a natural B1 English example, and exactly one topic ID from: {}. Return only JSON {{\"definitions\": {{\"term\": {{\"translation\": \"...\", \"example\": \"...\", \"topic\": \"topic_id\"}}}}}}. Terms: {}",
             TOPICS.join(", "),
             serde_json::to_string(&terms).map_err(|error| error.to_string())?
         );
@@ -891,7 +969,7 @@ async fn batch_categorize_vocabulary(
             .post(format!("{endpoint}/chat/completions"))
             .json(&json!({
                 "model": model, "stream": false, "response_format": {"type": "json_object"},
-                "messages": [{"role": "user", "content": prompt}], "max_tokens": 250
+                "messages": [{"role": "user", "content": prompt}], "max_tokens": 1_200
             }));
         if let Some(key) = api_key()? {
             request = request.bearer_auth(key);
@@ -909,8 +987,8 @@ async fn batch_categorize_vocabulary(
             let content = response["choices"][0]["message"]["content"]
                 .as_str()
                 .ok_or("9Router không trả nội dung.")?;
-            serde_json::from_str::<TopicAssignments>(content)
-                .map_err(|_| "Model trả JSON phân loại không hợp lệ.".to_string())
+            serde_json::from_str::<DefinitionAssignments>(content)
+                .map_err(|_| "Model trả JSON định nghĩa không hợp lệ.".to_string())
         }
         .await;
         let Ok(assignments) = result else {
@@ -922,20 +1000,33 @@ async fn batch_categorize_vocabulary(
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
         for (id, term) in chunk {
-            match assignments
-                .topics
-                .get(term)
-                .cloned()
-                .and_then(|topic| validate_topic(Some(topic)).ok())
-            {
-                Some(topic) => {
-                    updated_count += transaction.execute("UPDATE vocabulary SET topic = ?1, updated_at = ?2 WHERE id = ?3 AND topic IS NULL", params![topic, now(), id]).map_err(|error| error.to_string())?;
-                }
-                None => failed_count += 1,
-            }
+            let Some(definition) = assignments.definitions.get(term).cloned() else {
+                failed_count += 1;
+                continue;
+            };
+            let Ok(definition) = normalize_definition(definition) else {
+                failed_count += 1;
+                continue;
+            };
+            updated_count += transaction
+                .execute(
+                    "UPDATE vocabulary SET translation = ?1, example = ?2, topic = ?3,
+                 due_at = CASE WHEN last_reviewed_at IS NULL THEN ?4 ELSE due_at END,
+                 updated_at = ?4
+                 WHERE id = ?5 AND (translation IS NULL OR trim(translation) = '')",
+                    params![
+                        definition.translation,
+                        definition.example,
+                        definition.topic,
+                        now(),
+                        id
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
         }
         transaction.commit().map_err(|error| error.to_string())?;
     }
+    reschedule_reminder(&state);
     Ok(CategorizeResult {
         updated_count,
         failed_count,
@@ -1183,7 +1274,7 @@ fn next_review(state: State<'_, AppState>) -> Result<Option<ReviewCard>, String>
     let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
     connection
         .query_row(
-            "SELECT id, term, translation, example, due_at FROM vocabulary WHERE due_at <= ?1 ORDER BY due_at, id LIMIT 1",
+            "SELECT id, term, translation, example, due_at FROM vocabulary WHERE due_at <= ?1 AND translation IS NOT NULL AND trim(translation) != '' ORDER BY due_at, id LIMIT 1",
             [now()],
             |row| Ok(ReviewCard {
                 id: row.get(0)?, term: row.get(1)?, translation: row.get(2)?, example: row.get(3)?, due_at: row.get(4)?,
@@ -1507,7 +1598,8 @@ pub fn run() {
             capture_clipboard,
             save_word,
             list_vocabulary,
-            batch_categorize_vocabulary,
+            update_word,
+            batch_define_vocabulary,
             export_data,
             backup_sqlite,
             import_data,
@@ -1636,6 +1728,43 @@ mod tests {
         assert_eq!(second_page.items.len(), 1);
         assert_eq!(unclassified.total, 50);
         assert_eq!(unclassified.unclassified_count, 50);
+    }
+
+    #[test]
+    fn pending_words_stay_out_of_review_until_defined() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_db(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO vocabulary(term, normalized_term, due_at, created_at, updated_at)
+                 VALUES ('bark', 'bark', ?1, ?1, ?1)",
+                ["2026-10-04T00:00:00+00:00"],
+            )
+            .unwrap();
+        let pending: Option<i64> = connection
+            .query_row(
+                "SELECT id FROM vocabulary WHERE due_at <= ?1 AND translation IS NOT NULL AND trim(translation) != ''",
+                ["2026-10-04T00:00:00+00:00"],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(pending, None);
+        connection
+            .execute(
+                "UPDATE vocabulary SET translation = 'sủa' WHERE term = 'bark'",
+                [],
+            )
+            .unwrap();
+        let defined: Option<i64> = connection
+            .query_row(
+                "SELECT id FROM vocabulary WHERE due_at <= ?1 AND translation IS NOT NULL AND trim(translation) != ''",
+                ["2026-10-04T00:00:00+00:00"],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(defined.is_some());
     }
 
     #[test]
