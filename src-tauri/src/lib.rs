@@ -8,6 +8,7 @@ use std::{
 };
 
 use arboard::Clipboard;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Duration, Local, LocalResult, TimeZone, Timelike, Utc};
 use fsrs::{FSRS, MemoryState};
 use keyring::Entry;
@@ -116,6 +117,7 @@ struct CapturedWord {
 struct VocabularyItem {
     id: i64,
     term: String,
+    ipa: Option<String>,
     translation: Option<String>,
     example: Option<String>,
     topic: Option<String>,
@@ -143,6 +145,7 @@ struct CategorizeResult {
 struct ReviewCard {
     id: i64,
     term: String,
+    ipa: Option<String>,
     translation: Option<String>,
     example: Option<String>,
     due_at: String,
@@ -153,6 +156,7 @@ struct ReviewCard {
 struct SettingsPayload {
     endpoint: String,
     model: String,
+    audio_model: String,
     desired_retention: f32,
     quiet_hours_start: u8,
     quiet_hours_end: u8,
@@ -168,6 +172,7 @@ struct SettingsPayload {
 #[serde(rename_all = "camelCase")]
 struct SaveWordInput {
     term: String,
+    ipa: Option<String>,
     translation: Option<String>,
     example: Option<String>,
     topic: Option<String>,
@@ -191,6 +196,7 @@ struct BatchDefineVocabularyInput {
 #[serde(rename_all = "camelCase")]
 struct UpdateWordInput {
     id: i64,
+    ipa: Option<String>,
     translation: String,
     example: Option<String>,
     topic: Option<String>,
@@ -201,6 +207,7 @@ struct UpdateWordInput {
 struct SaveSettingsInput {
     endpoint: String,
     model: String,
+    audio_model: String,
     desired_retention: f32,
     quiet_hours_start: u8,
     quiet_hours_end: u8,
@@ -226,6 +233,7 @@ struct GeneratedContent {
     example: String,
     exercise: String,
     topic: String,
+    ipa: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -233,6 +241,32 @@ struct GeneratedDefinition {
     translation: String,
     example: String,
     topic: String,
+    ipa: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvaluatePronunciationInput {
+    card_id: i64,
+    audio_base64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PronunciationSegment {
+    part: String,
+    status: String,
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PronunciationAssessment {
+    score: u8,
+    is_correct: bool,
+    feedback: String,
+    recognized_text: String,
+    segments: Vec<PronunciationSegment>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,6 +280,8 @@ struct ExportVocabulary {
     id: i64,
     term: String,
     normalized_term: String,
+    #[serde(default)]
+    ipa: Option<String>,
     translation: Option<String>,
     example: Option<String>,
     #[serde(default)]
@@ -382,6 +418,41 @@ fn selection_capture() -> Result<String, String> {
     Err("Chụp text đang bôi đen chỉ hỗ trợ Windows.".into())
 }
 
+fn normalize_ipa(ipa: Option<String>) -> Result<Option<String>, String> {
+    let Some(ipa) = ipa
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if ipa.chars().count() > 200 || ipa.chars().any(char::is_control) {
+        return Err("IPA không hợp lệ hoặc quá 200 ký tự.".into());
+    }
+    Ok(Some(ipa))
+}
+
+fn validate_assessment(
+    assessment: PronunciationAssessment,
+) -> Result<PronunciationAssessment, String> {
+    if assessment.feedback.trim().is_empty()
+        || assessment.feedback.chars().count() > 2_000
+        || assessment.recognized_text.chars().count() > 500
+        || assessment.segments.len() > 20
+        || assessment.segments.iter().any(|segment| {
+            segment.part.trim().is_empty()
+                || segment.part.chars().count() > 100
+                || !matches!(segment.status.as_str(), "correct" | "needs_improvement")
+                || segment
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| note.chars().count() > 500)
+        })
+    {
+        return Err("Model trả chấm phát âm không hợp lệ.".into());
+    }
+    Ok(assessment)
+}
+
 fn validate_topic(topic: Option<String>) -> Result<Option<String>, String> {
     let Some(topic) = topic
         .map(|value| value.trim().to_owned())
@@ -415,6 +486,7 @@ fn initialize_db(connection: &Connection) -> Result<(), String> {
               translation TEXT,
               example TEXT,
               topic TEXT,
+              ipa TEXT,
               stability REAL,
               difficulty REAL,
               due_at TEXT NOT NULL,
@@ -451,6 +523,19 @@ fn initialize_db(connection: &Connection) -> Result<(), String> {
             .execute("ALTER TABLE vocabulary ADD COLUMN topic TEXT", [])
             .map_err(|error| error.to_string())?;
     }
+    let has_ipa = connection
+        .prepare("PRAGMA table_info(vocabulary)")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .try_fold(false, |found, column| Ok(found || column? == "ipa"))
+        })
+        .map_err(|error| error.to_string())?;
+    if !has_ipa {
+        connection
+            .execute("ALTER TABLE vocabulary ADD COLUMN ipa TEXT", [])
+            .map_err(|error| error.to_string())?;
+    }
     connection
         .execute_batch("CREATE INDEX IF NOT EXISTS idx_vocabulary_topic ON vocabulary(topic);")
         .map_err(|error| error.to_string())?;
@@ -458,6 +543,7 @@ fn initialize_db(connection: &Connection) -> Result<(), String> {
     for (key, value) in [
         ("endpoint", DEFAULT_ENDPOINT),
         ("model", DEFAULT_MODEL),
+        ("audio_model", ""),
         ("desired_retention", "0.9"),
         ("quiet_hours_start", "22"),
         ("quiet_hours_end", "8"),
@@ -732,6 +818,7 @@ fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<SettingsPa
     Ok(SettingsPayload {
         endpoint: setting(&connection, "endpoint")?,
         model: setting(&connection, "model")?,
+        audio_model: setting(&connection, "audio_model").unwrap_or_default(),
         desired_retention: setting(&connection, "desired_retention")?
             .parse()
             .unwrap_or(0.9),
@@ -769,6 +856,9 @@ fn save_settings(
     if !(0.80..=0.98).contains(&input.desired_retention) {
         return Err("Desired retention phải nằm trong 0.80 đến 0.98.".into());
     }
+    if input.audio_model.chars().count() > 200 {
+        return Err("Model chấm phát âm tối đa 200 ký tự.".into());
+    }
     if input.quiet_hours_start > 23 || input.quiet_hours_end > 23 {
         return Err("Giờ yên lặng không hợp lệ.".into());
     }
@@ -782,6 +872,7 @@ fn save_settings(
     let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
     upsert_setting(&connection, "endpoint", &endpoint)?;
     upsert_setting(&connection, "model", input.model.trim())?;
+    upsert_setting(&connection, "audio_model", input.audio_model.trim())?;
     upsert_setting(
         &connection,
         "desired_retention",
@@ -848,6 +939,7 @@ fn capture_clipboard() -> Result<String, String> {
 #[tauri::command]
 fn save_word(state: State<'_, AppState>, input: SaveWordInput) -> Result<CapturedWord, String> {
     let (normalized_term, term) = normalize_term(&input.term)?;
+    let ipa = normalize_ipa(input.ipa)?;
     let translation = input
         .translation
         .filter(|value| !value.trim().is_empty())
@@ -863,9 +955,9 @@ fn save_word(state: State<'_, AppState>, input: SaveWordInput) -> Result<Capture
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
     transaction.execute(
-        "INSERT INTO vocabulary(term, normalized_term, translation, example, topic, due_at, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)",
-        params![term, normalized_term, translation, example, topic, timestamp],
+        "INSERT INTO vocabulary(term, normalized_term, ipa, translation, example, topic, due_at, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7)",
+        params![term, normalized_term, ipa, translation, example, topic, timestamp],
     ).map_err(|error| {
         if error.to_string().contains("UNIQUE") { "Từ này đã có trong Inbox.".to_string() } else { error.to_string() }
     })?;
@@ -903,7 +995,7 @@ fn list_vocabulary_from_connection(
         None => "?2 = ''",
     };
     let sql = format!(
-        "SELECT id, term, translation, example, topic, due_at, created_at FROM vocabulary
+        "SELECT id, term, ipa, translation, example, topic, due_at, created_at FROM vocabulary
          WHERE (term LIKE ?1 OR COALESCE(translation, '') LIKE ?1) AND {filter}
          ORDER BY created_at DESC, id DESC LIMIT 50 OFFSET ?3"
     );
@@ -916,11 +1008,12 @@ fn list_vocabulary_from_connection(
             Ok(VocabularyItem {
                 id: row.get(0)?,
                 term: row.get(1)?,
-                translation: row.get(2)?,
-                example: row.get(3)?,
-                topic: row.get(4)?,
-                due_at: row.get(5)?,
-                created_at: row.get(6)?,
+                ipa: row.get(2)?,
+                translation: row.get(3)?,
+                example: row.get(4)?,
+                topic: row.get(5)?,
+                due_at: row.get(6)?,
+                created_at: row.get(7)?,
             })
         })
         .map_err(|error| error.to_string())?
@@ -972,6 +1065,7 @@ fn normalize_definition(definition: GeneratedDefinition) -> Result<GeneratedDefi
         translation,
         example,
         topic,
+        ipa: normalize_ipa(definition.ipa)?,
     })
 }
 
@@ -995,16 +1089,17 @@ fn update_word(state: State<'_, AppState>, input: UpdateWordInput) -> Result<(),
         return Err("Ví dụ tối đa 5.000 ký tự.".into());
     }
     let topic = validate_topic(input.topic)?;
+    let ipa = normalize_ipa(input.ipa)?;
     let timestamp = now();
     let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
     let updated = connection
         .execute(
             "UPDATE vocabulary
-             SET translation = ?1, example = ?2, topic = ?3,
-                 due_at = CASE WHEN last_reviewed_at IS NULL THEN ?4 ELSE due_at END,
-                 updated_at = ?4
-             WHERE id = ?5",
-            params![translation, example, topic, timestamp, input.id],
+             SET ipa = ?1, translation = ?2, example = ?3, topic = ?4,
+                 due_at = CASE WHEN last_reviewed_at IS NULL THEN ?5 ELSE due_at END,
+                 updated_at = ?5
+             WHERE id = ?6",
+            params![ipa, translation, example, topic, timestamp, input.id],
         )
         .map_err(|error| error.to_string())?;
     if updated == 0 {
@@ -1096,7 +1191,7 @@ async fn batch_define_vocabulary(
     for chunk in words.chunks(10) {
         let terms = chunk.iter().map(|(_, term)| term).collect::<Vec<_>>();
         let prompt = format!(
-            "For each English term, return concise Vietnamese translation, a natural B1 English example, and exactly one topic ID from: {}. Return only JSON {{\"definitions\": {{\"term\": {{\"translation\": \"...\", \"example\": \"...\", \"topic\": \"topic_id\"}}}}}}. Terms: {}",
+            "For each English term, return concise Vietnamese translation, IPA pronunciation, a natural B1 English example, and exactly one topic ID from: {}. Return only JSON {{\"definitions\": {{\"term\": {{\"translation\": \"...\", \"ipa\": \"/.../\", \"example\": \"...\", \"topic\": \"topic_id\"}}}}}}. Terms: {}",
             TOPICS.join(", "),
             serde_json::to_string(&terms).map_err(|error| error.to_string())?
         );
@@ -1146,11 +1241,12 @@ async fn batch_define_vocabulary(
             };
             updated_count += transaction
                 .execute(
-                    "UPDATE vocabulary SET translation = ?1, example = ?2, topic = ?3,
-                 due_at = CASE WHEN last_reviewed_at IS NULL THEN ?4 ELSE due_at END,
-                 updated_at = ?4
-                 WHERE id = ?5 AND (translation IS NULL OR trim(translation) = '')",
+                    "UPDATE vocabulary SET ipa = ?1, translation = ?2, example = ?3, topic = ?4,
+                 due_at = CASE WHEN last_reviewed_at IS NULL THEN ?5 ELSE due_at END,
+                 updated_at = ?5
+                 WHERE id = ?6 AND (translation IS NULL OR trim(translation) = '')",
                     params![
+                        definition.ipa,
                         definition.translation,
                         definition.example,
                         definition.topic,
@@ -1189,7 +1285,7 @@ fn backup_filename(extension: &str) -> String {
 
 fn export_from_connection(connection: &Connection) -> Result<ExportData, String> {
     let mut vocabulary_query = connection.prepare(
-        "SELECT id, term, normalized_term, translation, example, topic, stability, difficulty, due_at, last_reviewed_at, created_at, updated_at
+        "SELECT id, term, normalized_term, ipa, translation, example, topic, stability, difficulty, due_at, last_reviewed_at, created_at, updated_at
          FROM vocabulary ORDER BY id",
     ).map_err(|error| error.to_string())?;
     let vocabulary = vocabulary_query
@@ -1198,15 +1294,16 @@ fn export_from_connection(connection: &Connection) -> Result<ExportData, String>
                 id: row.get(0)?,
                 term: row.get(1)?,
                 normalized_term: row.get(2)?,
-                translation: row.get(3)?,
-                example: row.get(4)?,
-                topic: row.get(5)?,
-                stability: row.get(6)?,
-                difficulty: row.get(7)?,
-                due_at: row.get(8)?,
-                last_reviewed_at: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                ipa: row.get(3)?,
+                translation: row.get(4)?,
+                example: row.get(5)?,
+                topic: row.get(6)?,
+                stability: row.get(7)?,
+                difficulty: row.get(8)?,
+                due_at: row.get(9)?,
+                last_reviewed_at: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
             })
         })
         .map_err(|error| error.to_string())?
@@ -1275,6 +1372,7 @@ fn validate_import_word(word: &ExportVocabulary) -> Result<(String, String), Str
         return Err("Import chứa nghĩa hoặc ví dụ quá dài.".into());
     }
     validate_topic(word.topic.clone())?;
+    normalize_ipa(word.ipa.clone())?;
     parse_due(&word.due_at)?;
     parse_due(&word.created_at)?;
     parse_due(&word.updated_at)?;
@@ -1319,9 +1417,9 @@ fn import_into_connection(
             continue;
         }
         transaction.execute(
-            "INSERT INTO vocabulary(term, normalized_term, translation, example, topic, stability, difficulty, due_at, last_reviewed_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![term, normalized_term, word.translation, word.example, word.topic, word.stability, word.difficulty,
+            "INSERT INTO vocabulary(term, normalized_term, ipa, translation, example, topic, stability, difficulty, due_at, last_reviewed_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![term, normalized_term, word.ipa, word.translation, word.example, word.topic, word.stability, word.difficulty,
                 word.due_at, word.last_reviewed_at, word.created_at, word.updated_at],
         ).map_err(|error| error.to_string())?;
         if ids
@@ -1410,10 +1508,10 @@ fn next_review(state: State<'_, AppState>) -> Result<Option<ReviewCard>, String>
     let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
     connection
         .query_row(
-            "SELECT id, term, translation, example, due_at FROM vocabulary WHERE due_at <= ?1 AND translation IS NOT NULL AND trim(translation) != '' ORDER BY due_at, id LIMIT 1",
+            "SELECT id, term, ipa, translation, example, due_at FROM vocabulary WHERE due_at <= ?1 AND translation IS NOT NULL AND trim(translation) != '' ORDER BY due_at, id LIMIT 1",
             [now()],
             |row| Ok(ReviewCard {
-                id: row.get(0)?, term: row.get(1)?, translation: row.get(2)?, example: row.get(3)?, due_at: row.get(4)?,
+                id: row.get(0)?, term: row.get(1)?, ipa: row.get(2)?, translation: row.get(3)?, example: row.get(4)?, due_at: row.get(5)?,
             }),
         )
         .optional()
@@ -1543,7 +1641,7 @@ async fn generate_content(
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_owned());
     let prompt = format!(
-        "You help a Vietnamese learner learn English. For the term {term:?}{} return only one JSON object with keys translation, example, exercise, topic. translation: concise Vietnamese meaning. example: natural English sentence at B1 level. exercise: one short cloze question. topic must be exactly one of: {}. No markdown.",
+        "You help a Vietnamese learner learn English. For the term {term:?}{} return only one JSON object with keys translation, ipa, example, exercise, topic. translation: concise Vietnamese meaning. ipa: concise International Phonetic Alphabet pronunciation, including /.../. example: natural English sentence at B1 level. exercise: one short cloze question. topic must be exactly one of: {}. No markdown.",
         known_translation
             .map(|value| format!(" (known Vietnamese meaning: {value:?})"))
             .unwrap_or_default(),
@@ -1585,7 +1683,94 @@ async fn generate_content(
     }
     validate_topic(Some(generated.topic.clone()))
         .map_err(|_| "Model trả chủ đề không hợp lệ.".to_string())?;
+    normalize_ipa(generated.ipa.clone())?;
     Ok(generated)
+}
+
+#[tauri::command]
+async fn evaluate_pronunciation(
+    state: State<'_, AppState>,
+    input: EvaluatePronunciationInput,
+) -> Result<PronunciationAssessment, String> {
+    if input.card_id <= 0 {
+        return Err("ID từ không hợp lệ.".into());
+    }
+    if input.audio_base64.len() > 1_400_000 {
+        return Err("Bản ghi quá lớn. Ghi tối đa 10 giây rồi thử lại.".into());
+    }
+    let audio = BASE64
+        .decode(input.audio_base64.as_bytes())
+        .map_err(|_| "Bản ghi audio không hợp lệ.".to_string())?;
+    if audio.len() < 44
+        || audio.len() > 1_000_000
+        || &audio[0..4] != b"RIFF"
+        || &audio[8..12] != b"WAVE"
+    {
+        return Err("Bản ghi phải là WAV tối đa 1 MB.".into());
+    }
+    let (endpoint, model, enabled, term, ipa) = {
+        let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
+        let (term, ipa): (String, Option<String>) = connection
+            .query_row(
+                "SELECT term, ipa FROM vocabulary WHERE id = ?1 AND translation IS NOT NULL AND trim(translation) != ''",
+                [input.card_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| "Không tìm thấy thẻ để chấm phát âm.".to_string())?;
+        let audio_model = setting(&connection, "audio_model").unwrap_or_default();
+        (
+            setting(&connection, "endpoint")?,
+            if audio_model.trim().is_empty() {
+                setting(&connection, "model")?
+            } else {
+                audio_model
+            },
+            setting(&connection, "ai_enabled")? == "true",
+            term,
+            ipa,
+        )
+    };
+    if !enabled {
+        return Err("AI đang tắt trong Settings.".into());
+    }
+    if model.trim().is_empty() {
+        return Err("Chọn model hỗ trợ audio trong Settings trước.".into());
+    }
+    let prompt = format!(
+        "Listen to this Vietnamese learner pronounce English target {term:?}. Expected IPA: {}. Return only JSON {{\"score\": 0-100, \"isCorrect\": boolean, \"feedback\": \"concise Vietnamese feedback\", \"recognizedText\": \"what was heard\", \"segments\": [{{\"part\": \"sound or word part\", \"status\": \"correct|needs_improvement\", \"note\": \"Vietnamese tip\"}}]}}.",
+        ipa.as_deref().unwrap_or("not available")
+    );
+    let mut request = state
+        .http
+        .post(format!("{endpoint}/chat/completions"))
+        .json(&json!({
+            "model": model,
+            "stream": false,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "input_audio", "input_audio": {"data": input.audio_base64, "format": "wav"}}
+            ]}],
+            "max_tokens": 500
+        }));
+    if let Some(key) = api_key()? {
+        request = request.bearer_auth(key);
+    }
+    let response: Value = request
+        .send()
+        .await
+        .map_err(|error| format!("Không kết nối được 9Router: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Model {model:?} không hỗ trợ audio hoặc 9Router lỗi: {error}"))?
+        .json()
+        .await
+        .map_err(|error| format!("9Router trả response lỗi: {error}"))?;
+    let content = response["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or("9Router không trả chấm phát âm.")?;
+    let assessment = serde_json::from_str(content)
+        .map_err(|_| "Model trả JSON chấm phát âm không hợp lệ.".to_string())?;
+    validate_assessment(assessment)
 }
 
 #[tauri::command]
@@ -1753,6 +1938,7 @@ pub fn run() {
             rate_review,
             ai_models,
             generate_content,
+            evaluate_pronunciation,
             toggle_passthrough,
             set_window_mode
         ])
@@ -2038,5 +2224,87 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn ipa_normalization_and_validation() {
+        assert_eq!(
+            normalize_ipa(Some(" /həˈloʊ/ ".into())).unwrap(),
+            Some("/həˈloʊ/".into())
+        );
+        assert_eq!(normalize_ipa(Some("   ".into())).unwrap(), None);
+        assert_eq!(normalize_ipa(None).unwrap(), None);
+        // control char rejected
+        assert!(normalize_ipa(Some("ipa\nvalue".into())).is_err());
+        // > 200 chars rejected
+        let long_ipa = "a".repeat(201);
+        assert!(normalize_ipa(Some(long_ipa)).is_err());
+    }
+
+    #[test]
+    fn assessment_validation() {
+        let valid = PronunciationAssessment {
+            score: 85,
+            is_correct: true,
+            feedback: "Phát âm tốt".into(),
+            recognized_text: "hello".into(),
+            segments: vec![PronunciationSegment {
+                part: "hel".into(),
+                status: "correct".into(),
+                note: Some("Âm /h/ rõ".into()),
+            }],
+        };
+        assert!(validate_assessment(valid).is_ok());
+
+        let empty_feedback = PronunciationAssessment {
+            score: 0,
+            is_correct: false,
+            feedback: "   ".into(),
+            recognized_text: "hello".into(),
+            segments: vec![],
+        };
+        assert!(validate_assessment(empty_feedback).is_err());
+
+        let invalid_status = PronunciationAssessment {
+            score: 50,
+            is_correct: false,
+            feedback: "Thử lại".into(),
+            recognized_text: "test".into(),
+            segments: vec![PronunciationSegment {
+                part: "te".into(),
+                status: "unknown".into(),
+                note: None,
+            }],
+        };
+        assert!(validate_assessment(invalid_status).is_err());
+    }
+
+    #[test]
+    fn ipa_migration_and_export_import_roundtrip() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_db(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO vocabulary(term, normalized_term, ipa, translation, example, topic, due_at, created_at, updated_at)
+                 VALUES ('sound', 'sound', '/saʊnd/', 'âm thanh', 'Good sound.', 'entertainment', ?1, ?1, ?1)",
+                ["2026-10-04T00:00:00+00:00"],
+            )
+            .unwrap();
+        let export = export_from_connection(&connection).unwrap();
+        assert_eq!(export.vocabulary.len(), 1);
+        assert_eq!(export.vocabulary[0].ipa.as_deref(), Some("/saʊnd/"));
+
+        let destination = Connection::open_in_memory().unwrap();
+        initialize_db(&destination).unwrap();
+        let result = import_into_connection(&destination, export).unwrap();
+        assert_eq!(result.imported_words, 1);
+        let imported_ipa: Option<String> = destination
+            .query_row(
+                "SELECT ipa FROM vocabulary WHERE term = 'sound'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported_ipa.as_deref(), Some("/saʊnd/"));
     }
 }

@@ -16,6 +16,13 @@ Do not use a remote endpoint unless you accept its operator and downstream AI pr
 
 9Router API key, when required, is saved in Windows Credential Manager. It is never written to SQLite, export data, or app logs.
 
+## Audio and Pronunciation
+
+- **Speaker playback (TTS)**: Clicking 🔊 plays native pronunciation using Windows Web Speech API (`SpeechSynthesis`). It runs completely offline on device, creates no network traffic, and downloads or saves no audio files.
+- **Microphone and pronunciation assessment**: Microphone access is only requested when you explicitly click **Bắt đầu đọc** in the review dialog's optional practice section. Audio is captured in-memory only, capped at 10 seconds.
+- Voice recordings and assessment scores are **never** saved to SQLite, local backup files, exports, or app logs. Discarding, re-recording, closing the dialog, or moving to the next card immediately releases recorded audio.
+- Audio and the target word/IPA leave your computer **only** when you explicitly click **Chấm điểm**, sent directly to your configured 9Router endpoint. If you do not wish to evaluate pronunciation or lack microphone access, you can skip pronunciation practice and rate your review card directly at any time.
+
 ## Backup and restore
 
 In Settings, **Export JSON** writes a version 2 vocabulary, optional topic, and FSRS review-history export to `Documents\English Pet Backups`; English Pet still imports version 1 exports. **Backup SQLite** writes a consistent SQLite snapshot to same folder using SQLite's online backup API. Neither file includes 9Router API key. Release builds ship both per-user NSIS and MSI installers; neither uninstaller removes local learning data or backups automatically.
