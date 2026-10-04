@@ -161,7 +161,7 @@ struct SettingsPayload {
     quiet_hours_start: u8,
     quiet_hours_end: u8,
     pet_passthrough: bool,
-    pet_size: String,
+    pet_scale: f32,
     pet_opacity: f32,
     ai_enabled: bool,
     autostart: bool,
@@ -212,7 +212,7 @@ struct SaveSettingsInput {
     quiet_hours_start: u8,
     quiet_hours_end: u8,
     pet_passthrough: bool,
-    pet_size: String,
+    pet_scale: f32,
     pet_opacity: f32,
     ai_enabled: bool,
     autostart: bool,
@@ -582,12 +582,34 @@ fn upsert_setting(connection: &Connection, key: &str, value: &str) -> Result<(),
     Ok(())
 }
 
-fn pet_dimensions(size: &str) -> (f64, f64) {
-    match size {
-        "small" => (224.0, 224.0),
-        "large" => (350.0, 350.0),
-        _ => (280.0, 280.0),
+fn pet_scale(connection: &Connection) -> f32 {
+    if let Ok(scale) = setting(connection, "pet_scale")
+        .and_then(|value| value.parse::<f32>().map_err(|error| error.to_string()))
+    {
+        if scale.is_finite() && (0.4..=1.25).contains(&scale) {
+            return scale;
+        }
     }
+    match setting(connection, "pet_size").as_deref() {
+        Ok("small") => 0.8,
+        Ok("large") => 1.25,
+        _ => 1.0,
+    }
+}
+
+fn legacy_pet_size(scale: f32) -> &'static str {
+    if scale <= 0.85 {
+        "small"
+    } else if scale >= 1.15 {
+        "large"
+    } else {
+        "medium"
+    }
+}
+
+fn pet_dimensions(scale: f32) -> (f64, f64) {
+    let side = (280.0 * f64::from(scale)).round();
+    (side, side)
 }
 
 fn clamp_coordinate(value: i32, minimum: i32, maximum: i32) -> i32 {
@@ -829,7 +851,7 @@ fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<SettingsPa
             .parse()
             .unwrap_or(8),
         pet_passthrough: setting(&connection, "pet_passthrough")? == "true",
-        pet_size: setting(&connection, "pet_size").unwrap_or_else(|_| "medium".into()),
+        pet_scale: pet_scale(&connection),
         pet_opacity: setting(&connection, "pet_opacity")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -862,8 +884,8 @@ fn save_settings(
     if input.quiet_hours_start > 23 || input.quiet_hours_end > 23 {
         return Err("Giờ yên lặng không hợp lệ.".into());
     }
-    if !matches!(input.pet_size.as_str(), "small" | "medium" | "large") {
-        return Err("Kích thước pet không hợp lệ.".into());
+    if !input.pet_scale.is_finite() || !(0.4..=1.25).contains(&input.pet_scale) {
+        return Err("Kích thước pet phải nằm trong 40% đến 125%.".into());
     }
     if !input.pet_opacity.is_finite() || !(0.2..=1.0).contains(&input.pet_opacity) {
         return Err("Độ trong suốt phải nằm trong 20% đến 100%.".into());
@@ -893,7 +915,8 @@ fn save_settings(
         "pet_passthrough",
         &input.pet_passthrough.to_string(),
     )?;
-    upsert_setting(&connection, "pet_size", &input.pet_size)?;
+    upsert_setting(&connection, "pet_scale", &input.pet_scale.to_string())?;
+    upsert_setting(&connection, "pet_size", legacy_pet_size(input.pet_scale))?;
     upsert_setting(&connection, "pet_opacity", &input.pet_opacity.to_string())?;
     upsert_setting(&connection, "ai_enabled", &input.ai_enabled.to_string())?;
     drop(connection);
@@ -918,7 +941,7 @@ fn save_settings(
     let window = app
         .get_webview_window("main")
         .ok_or("Pet window unavailable")?;
-    let (width, height) = pet_dimensions(&input.pet_size);
+    let (width, height) = pet_dimensions(input.pet_scale);
     fit_window(&window, width, height)?;
     reschedule_reminder(&state);
     Ok(())
@@ -1793,7 +1816,7 @@ fn set_window_mode(app: AppHandle, state: State<'_, AppState>, mode: String) -> 
         "settings" | "inbox" | "edit" => (580.0, 800.0),
         "pet" => {
             let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
-            pet_dimensions(&setting(&connection, "pet_size").unwrap_or_else(|_| "medium".into()))
+            pet_dimensions(pet_scale(&connection))
         }
         _ => return Err("Chế độ cửa sổ không hợp lệ.".into()),
     };
@@ -1898,7 +1921,7 @@ pub fn run() {
                 reminder_tx,
             });
             setup_tray(app.handle())?;
-            let (passthrough, pet_size) = app
+            let (passthrough, scale) = app
                 .state::<AppState>()
                 .db
                 .lock()
@@ -1906,12 +1929,12 @@ pub fn run() {
                 .map(|db| {
                     (
                         setting(&db, "pet_passthrough").is_ok_and(|value| value == "true"),
-                        setting(&db, "pet_size").unwrap_or_else(|_| "medium".into()),
+                        pet_scale(&db),
                     )
                 })
-                .unwrap_or((false, "medium".into()));
+                .unwrap_or((false, 1.0));
             if let Some(window) = app.get_webview_window("main") {
-                let (width, height) = pet_dimensions(&pet_size);
+                let (width, height) = pet_dimensions(scale);
                 let _ = fit_window(&window, width, height);
             }
             if passthrough {
@@ -1954,6 +1977,28 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pet_scale_keeps_legacy_settings_and_ignores_invalid_values() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_db(&connection).unwrap();
+        upsert_setting(&connection, "pet_size", "small").unwrap();
+        assert_eq!(pet_scale(&connection), 0.8);
+
+        upsert_setting(&connection, "pet_scale", "0.4").unwrap();
+        assert_eq!(pet_scale(&connection), 0.4);
+        upsert_setting(&connection, "pet_scale", "0.39").unwrap();
+        assert_eq!(pet_scale(&connection), 0.8);
+    }
+
+    #[test]
+    fn pet_dimensions_match_slider_bounds() {
+        assert_eq!(pet_dimensions(0.4), (112.0, 112.0));
+        assert_eq!(pet_dimensions(1.25), (350.0, 350.0));
+        assert_eq!(legacy_pet_size(0.4), "small");
+        assert_eq!(legacy_pet_size(1.0), "medium");
+        assert_eq!(legacy_pet_size(1.25), "large");
+    }
 
     #[test]
     fn normalizes_one_short_phrase() {

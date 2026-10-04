@@ -29,7 +29,7 @@ type Settings = {
   quietHoursStart: number
   quietHoursEnd: number
   petPassthrough: boolean
-  petSize: 'small' | 'medium' | 'large'
+  petScale: number
   petOpacity: number
   aiEnabled: boolean
   autostart: boolean
@@ -75,7 +75,7 @@ const topics: Record<Topic, string> = {
 
 const initialSettings: Settings = {
   endpoint: 'http://localhost:20128/v1', model: '', audioModel: '', desiredRetention: 0.9,
-  quietHoursStart: 22, quietHoursEnd: 8, petPassthrough: false, petSize: 'medium', petOpacity: 1, aiEnabled: true, autostart: false, hasApiKey: false,
+  quietHoursStart: 22, quietHoursEnd: 8, petPassthrough: false, petScale: 1, petOpacity: 1, aiEnabled: true, autostart: false, hasApiKey: false,
 }
 
 async function audioBlobToWavBase64(blob: Blob): Promise<string> {
@@ -502,8 +502,7 @@ function App() {
     <section
       ref={petRef}
       className={`pet-shell ${dragging ? 'is-dragging' : ''} ${reminding ? 'is-reminding' : ''} ${feedPhase ? `is-${feedPhase}` : ''}`}
-      data-size={settings.petSize}
-      style={{ '--pet-opacity': settings.petOpacity } as React.CSSProperties}
+      style={{ '--pet-opacity': settings.petOpacity, '--pet-scale': settings.petScale } as React.CSSProperties}
       onPointerDown={dragWindow}
       onDragEnter={(event) => { event.preventDefault(); setDragging(true) }}
       onDragOver={(event) => event.preventDefault()}
@@ -651,7 +650,7 @@ function App() {
       <Field label="Model chấm phát âm (hỗ trợ audio)"><div className="inline"><input value={settings.audioModel} list="models" onChange={(event) => setSettings({ ...settings, audioModel: event.target.value })} placeholder="Để trống để dùng model ở trên" /></div><small className="field-hint">Chỉ dùng khi model hỗ trợ input_audio. Để trống sẽ dùng model chung.</small></Field>
       <Field label="9Router API key"><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={settings.hasApiKey ? 'Đã lưu an toàn. Nhập để thay hoặc xóa.' : 'Tùy chọn, chỉ nếu 9Router yêu cầu'} /></Field>
       <div className="setting-grid"><Field label="Desired retention"><input type="number" min="0.8" max="0.98" step="0.01" value={settings.desiredRetention} onChange={(event) => setSettings({ ...settings, desiredRetention: Number(event.target.value) })} /></Field><Field label="Giờ yên lặng từ"><input type="number" min="0" max="23" value={settings.quietHoursStart} onChange={(event) => setSettings({ ...settings, quietHoursStart: Number(event.target.value) })} /></Field><Field label="đến"><input type="number" min="0" max="23" value={settings.quietHoursEnd} onChange={(event) => setSettings({ ...settings, quietHoursEnd: Number(event.target.value) })} /></Field></div>
-      <Field label="Kích thước pet"><select value={settings.petSize} onChange={(event) => setSettings({ ...settings, petSize: event.target.value as Settings['petSize'] })}><option value="small">Nhỏ</option><option value="medium">Vừa</option><option value="large">Lớn</option></select></Field>
+      <Field label={`Kích thước pet: ${Math.round(settings.petScale * 100)}%`}><input type="range" min="0.4" max="1.25" step="0.05" value={settings.petScale} onChange={(event) => setSettings({ ...settings, petScale: Number(event.target.value) })} /></Field>
       <Field label={`Độ trong suốt pet: ${Math.round(settings.petOpacity * 100)}%`}><input type="range" min="0.2" max="1" step="0.05" value={settings.petOpacity} onChange={(event) => setSettings({ ...settings, petOpacity: Number(event.target.value) })} /></Field>
       <label className="check"><input type="checkbox" checked={settings.aiEnabled} onChange={(event) => setSettings({ ...settings, aiEnabled: event.target.checked })} /> Cho phép gửi từ đang thêm tới 9Router khi bấm “Tạo bằng AI”</label>
       <label className="check"><input type="checkbox" checked={settings.petPassthrough} onChange={(event) => setSettings({ ...settings, petPassthrough: event.target.checked })} /> Click xuyên pet (mở tray để bật lại tương tác)</label>
