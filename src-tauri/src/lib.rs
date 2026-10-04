@@ -1790,7 +1790,7 @@ fn set_window_mode(app: AppHandle, state: State<'_, AppState>, mode: String) -> 
         .ok_or("Pet window unavailable")?;
     let (width, height) = match mode.as_str() {
         "capture" | "review" => (460.0, 620.0),
-        "settings" | "inbox" => (580.0, 800.0),
+        "settings" | "inbox" | "edit" => (580.0, 800.0),
         "pet" => {
             let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
             pet_dimensions(&setting(&connection, "pet_size").unwrap_or_else(|_| "medium".into()))
