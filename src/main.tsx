@@ -51,6 +51,22 @@ type ConfirmationRequest = {
   danger?: boolean
   onConfirm: () => Promise<void>
 }
+type LetterToken = { id: number; value: string }
+type ChallengeStep = 'preview' | 'letters' | 'type' | 'complete'
+
+const splitGraphemes = (value: string) => {
+  const Segmenter = (Intl as typeof Intl & { Segmenter?: new (locale?: string, options?: { granularity: 'grapheme' }) => { segment: (text: string) => Iterable<{ segment: string }> } }).Segmenter
+  return Segmenter ? Array.from(new Segmenter(undefined, { granularity: 'grapheme' }).segment(value), ({ segment }) => segment) : Array.from(value)
+}
+const shuffledTokens = (term: string): LetterToken[] => {
+  const tokens = splitGraphemes(term).filter((character) => !/\s/.test(character)).map((value, id) => ({ id, value }))
+  for (let index = tokens.length - 1; index > 0; index--) {
+    const other = Math.floor(Math.random() * (index + 1))
+    ;[tokens[index], tokens[other]] = [tokens[other], tokens[index]]
+  }
+  return tokens
+}
+const normalizeAnswer = (value: string) => value.trim().replace(/\s+/g, ' ').toLocaleLowerCase()
 
 const topics: Record<Topic, string> = {
   daily_life: 'Đời sống', work_tech: 'Công việc & Công nghệ', study_academic: 'Học tập', travel_places: 'Du lịch', food_dining: 'Ẩm thực',
@@ -131,6 +147,12 @@ function App() {
   const [message, setMessage] = useState<string | null>(null)
   const [reminding, setReminding] = useState(false)
   const [showMeaning, setShowMeaning] = useState(false)
+  const [challengeStep, setChallengeStep] = useState<ChallengeStep>('letters')
+  const [letterTokens, setLetterTokens] = useState<LetterToken[]>([])
+  const [selectedTokenIds, setSelectedTokenIds] = useState<number[]>([])
+  const [typedAnswer, setTypedAnswer] = useState('')
+  const [challengeFeedback, setChallengeFeedback] = useState<string | null>(null)
+  const typeAnswerRef = useRef<HTMLInputElement>(null)
   const [practiceOpen, setPracticeOpen] = useState(false)
   const [recording, setRecording] = useState(false)
   const [recordedAudio, setRecordedAudio] = useState<string | null>(null)
@@ -232,6 +254,39 @@ function App() {
       setBusy(false)
     }
   }
+  const resetChallenge = (card: ReviewCard | null) => {
+    setChallengeStep('preview')
+    setLetterTokens(card ? shuffledTokens(card.term) : [])
+    setSelectedTokenIds([])
+    setTypedAnswer('')
+    setChallengeFeedback(null)
+  }
+  const chooseLetter = (token: LetterToken) => {
+    if (!review || challengeStep !== 'letters') return
+    const expected = splitGraphemes(review.term).filter((character) => !/\s/.test(character))
+    const selected = [...selectedTokenIds, token.id]
+    if (token.value !== expected[selectedTokenIds.length]) {
+      setSelectedTokenIds([])
+      setChallengeFeedback('Chưa đúng thứ tự. Thử lại từ đầu nhé.')
+      return
+    }
+    setSelectedTokenIds(selected)
+    setChallengeFeedback(null)
+    if (selected.length === expected.length) {
+      setChallengeStep('type')
+      window.setTimeout(() => typeAnswerRef.current?.focus(), 0)
+    }
+  }
+  const checkTypedAnswer = () => {
+    if (!review || challengeStep !== 'type') return
+    if (normalizeAnswer(typedAnswer) !== normalizeAnswer(review.term)) {
+      setChallengeFeedback('Chưa đúng. Kiểm tra lại chính tả rồi thử tiếp.')
+      typeAnswerRef.current?.focus()
+      return
+    }
+    setChallengeFeedback('✓ Hoàn thành hai thử thách. Bạn có thể chọn mức ôn.')
+    setChallengeStep('complete')
+  }
   const feedWord = async (rawTerm?: string) => {
     if (feedingWord) return
     try {
@@ -261,7 +316,7 @@ function App() {
     try {
       clearRecording()
       const card = await api<ReviewCard | null>('next_review')
-      setReview(card); setShowMeaning(false); setPracticeOpen(false); setModal('review')
+      setReview(card); resetChallenge(card); setShowMeaning(false); setPracticeOpen(false); setModal('review')
     } catch (error) { notify(String(error)) }
   }
   const openSettings = async () => {
@@ -370,7 +425,7 @@ function App() {
       notify(await api<string>('rate_review', { cardId: review.id, rating }))
       await refresh()
       const next = await api<ReviewCard | null>('next_review')
-      setReview(next); setShowMeaning(false)
+      setReview(next); resetChallenge(next); setShowMeaning(false)
     } catch (error) { notify(String(error)) } finally { setBusy(false) }
   }
   const saveSettings = async () => {
@@ -500,12 +555,30 @@ function App() {
     {modal === 'review' && <Dialog title="Ôn cùng pet" onClose={() => setModal(null)}>
       {!review ? <div className="empty"><span>✦</span><h2>Hết từ đến hạn</h2><p>Pet nghỉ một chút. Thêm từ mới hoặc quay lại sau.</p></div> : <article className="review-card">
         <small>English → Vietnamese</small>
-        <div className="term-row">
+        {challengeStep === 'preview' || challengeStep === 'complete' ? <div className="term-row">
           <h1>{review.term}</h1>
           <button className="speaker-button" type="button" aria-label={`Nghe phát âm ${review.term}`} onClick={() => speak(review.term)}>🔊</button>
-        </div>
+        </div> : <h1 className="hidden-term">?</h1>}
         {review.ipa && <p className="term-ipa">{review.ipa}</p>}
-        {showMeaning ? <><p className="meaning">{review.translation}</p>{review.example && <p className="example">“{review.example}”</p>}</> : <button className="reveal" onClick={() => setShowMeaning(true)}>Hiện nghĩa</button>}
+        {challengeStep === 'preview' ? <><p className="meaning">{review.translation}</p>{review.example && <p className="example">“{review.example}”</p>}<button className="primary remember-button" type="button" onClick={() => { setShowMeaning(true); setChallengeStep('letters') }}>Đã nhớ · Bắt đầu thử thách</button></> : showMeaning ? <><p className="meaning">{review.translation}</p>{review.example && <p className="example">“{review.example}”</p>}</> : null}
+
+        {showMeaning && challengeStep === 'letters' && <section className="recall-challenge" aria-label="Thử thách chọn chữ cái">
+          <p className="challenge-kicker">Thử thách 1/2 · Ghép từ</p>
+          <p className="challenge-prompt">Chọn các ký tự theo đúng thứ tự để ghép từ.</p>
+          <div className="chosen-letters" aria-live="polite">{selectedTokenIds.length ? selectedTokenIds.map((id) => letterTokens.find((token) => token.id === id)?.value).join('') : 'Chưa chọn ký tự nào'}</div>
+          <div className="letter-choices">{letterTokens.map((token) => <button key={token.id} type="button" className="letter-token" disabled={selectedTokenIds.includes(token.id)} aria-label={`Chọn ký tự ${token.value}`} onClick={() => chooseLetter(token)}>{token.value}</button>)}</div>
+        </section>}
+
+        {showMeaning && challengeStep === 'type' && <section className="recall-challenge" aria-label="Thử thách gõ từ">
+          <p className="challenge-kicker">Thử thách 2/2 · Tự gõ lại</p>
+          <p className="challenge-prompt">Nhập chính xác từ hoặc cụm từ tiếng Anh.</p>
+          <form className="challenge-form" onSubmit={(event) => { event.preventDefault(); checkTypedAnswer() }}>
+            <input ref={typeAnswerRef} value={typedAnswer} onChange={(event) => { setTypedAnswer(event.target.value); setChallengeFeedback(null) }} autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} aria-invalid={Boolean(challengeFeedback)} placeholder="Nhập từ tiếng Anh" />
+            <button className="primary" type="submit">Kiểm tra</button>
+          </form>
+        </section>}
+
+        {showMeaning && challengeFeedback && <p className={`challenge-feedback ${challengeStep === 'complete' ? 'is-correct' : ''}`} role="status">{challengeFeedback}</p>}
 
         <section className="practice-section" aria-label="Luyện phát âm">
           <button className="secondary toggle-practice" type="button" onClick={() => setPracticeOpen(!practiceOpen)}>
@@ -553,11 +626,12 @@ function App() {
           </div>}
         </section>
 
+        {challengeStep !== 'complete' && <p className="rating-lock">🔒 Hoàn thành 2 thử thách để chọn mức ôn.</p>}
         <div className="ratings">
-          <button className="again" disabled={busy} onClick={() => void rate(1)}>Again</button>
-          <button className="hard" disabled={busy} onClick={() => void rate(2)}>Hard</button>
-          <button className="good" disabled={busy} onClick={() => void rate(3)}>Good</button>
-          <button className="easy" disabled={busy} onClick={() => void rate(4)}>Easy</button>
+          <button className="again" disabled={busy || challengeStep !== 'complete'} onClick={() => void rate(1)}>Again</button>
+          <button className="hard" disabled={busy || challengeStep !== 'complete'} onClick={() => void rate(2)}>Hard</button>
+          <button className="good" disabled={busy || challengeStep !== 'complete'} onClick={() => void rate(3)}>Good</button>
+          <button className="easy" disabled={busy || challengeStep !== 'complete'} onClick={() => void rate(4)}>Easy</button>
         </div>
       </article>}
     </Dialog>}
