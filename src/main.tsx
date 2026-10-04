@@ -44,6 +44,13 @@ type VocabularyItem = { id: number; term: string; ipa: string | null; translatio
 type VocabularyPage = { items: VocabularyItem[]; total: number; unclassifiedCount: number }
 type FeedPhase = 'flying' | 'chewing' | 'happy' | null
 type Modal = 'review' | 'settings' | 'inbox' | 'edit' | null
+type ConfirmationRequest = {
+  title: string
+  description: React.ReactNode
+  confirmLabel: string
+  danger?: boolean
+  onConfirm: () => Promise<void>
+}
 
 const topics: Record<Topic, string> = {
   daily_life: 'Đời sống', work_tech: 'Công việc & Công nghệ', study_academic: 'Học tập', travel_places: 'Du lịch', food_dining: 'Ẩm thực',
@@ -129,7 +136,10 @@ function App() {
   const [recordedAudio, setRecordedAudio] = useState<string | null>(null)
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null)
   const [assessment, setAssessment] = useState<PronunciationAssessment | null>(null)
+  const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null)
+  const [confirming, setConfirming] = useState(false)
   const recorderRef = useRef<MediaRecorder | null>(null)
+  const confirmingRef = useRef(false)
   const streamRef = useRef<MediaStream | null>(null)
   const recordTimerRef = useRef<number | null>(null)
   const petRef = useRef<HTMLDivElement>(null)
@@ -325,14 +335,32 @@ function App() {
       await loadVocabulary(); await refresh(); notify(`AI đã định nghĩa “${word.term}”.`)
     } catch (error) { notify(String(error)) } finally { setBusy(false) }
   }
-  const deletePendingWord = async (word: VocabularyItem) => {
-    if (!window.confirm(`Xóa “${word.term}” khỏi danh sách chờ định nghĩa?`)) return
-    setBusy(true)
+  const requestConfirmation = (request: ConfirmationRequest) => setConfirmation(request)
+  const confirm = async () => {
+    if (!confirmation || confirmingRef.current) return
+    confirmingRef.current = true
+    setConfirming(true)
     try {
-      await api('delete_pending_word', { id: word.id })
-      await loadVocabulary(); await refresh(); notify(`Đã xóa “${word.term}”.`)
-    } catch (error) { notify(String(error)) } finally { setBusy(false) }
+      await confirmation.onConfirm()
+      setConfirmation(null)
+    } finally {
+      confirmingRef.current = false
+      setConfirming(false)
+    }
   }
+  const deletePendingWord = (word: VocabularyItem) => requestConfirmation({
+    title: 'Xóa từ chờ?',
+    description: <>“{word.term}” sẽ bị xóa khỏi Inbox. Từ đã định nghĩa không thể xóa ở đây.</>,
+    confirmLabel: 'Xóa từ',
+    danger: true,
+    onConfirm: async () => {
+      setBusy(true)
+      try {
+        await api('delete_pending_word', { id: word.id })
+        await loadVocabulary(); await refresh(); notify(`Đã xóa “${word.term}”.`)
+      } catch (error) { notify(String(error)) } finally { setBusy(false) }
+    },
+  })
   const rate = async (rating: number) => {
     if (!review) return
     clearRecording()
@@ -377,28 +405,41 @@ function App() {
     setBusy(true)
     try { notify(`Đã backup SQLite: ${await api<string>('backup_sqlite')}`) } catch (error) { notify(String(error)) } finally { setBusy(false) }
   }
-  const importData = async (event: React.ChangeEvent<HTMLInputElement>) => {
+  const importData = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
     event.target.value = ''
     if (!file) return
-    if (!window.confirm(`Import ${file.name}? Dữ liệu mới được thêm vào; từ trùng sẽ bị bỏ qua.`)) return
-    setBusy(true)
-    try {
-      const result = await api<{ importedWords: number; skippedWords: number; importedReviews: number }>('import_data', { contents: await file.text() })
-      await refresh()
-      notify(`Đã import ${result.importedWords} từ, ${result.importedReviews} lượt ôn; bỏ qua ${result.skippedWords} từ trùng.`)
-    } catch (error) { notify(String(error)) } finally { setBusy(false) }
+    requestConfirmation({
+      title: 'Import dữ liệu?',
+      description: <><b>{file.name}</b> sẽ thêm từ và lịch sử ôn mới. Từ trùng sẽ được bỏ qua, dữ liệu hiện có không bị thay thế.</>,
+      confirmLabel: 'Import',
+      onConfirm: async () => {
+        setBusy(true)
+        try {
+          const result = await api<{ importedWords: number; skippedWords: number; importedReviews: number }>('import_data', { contents: await file.text() })
+          await refresh()
+          notify(`Đã import ${result.importedWords} từ, ${result.importedReviews} lượt ôn; bỏ qua ${result.skippedWords} từ trùng.`)
+        } catch (error) { notify(String(error)) } finally { setBusy(false) }
+      },
+    })
   }
-  const definePendingWithAi = async () => {
+  const definePendingWithAi = () => {
     const ids = vocabulary.items.filter((word) => !word.translation).map((word) => word.id)
     if (!ids.length) return
-    if (!window.confirm(`Gửi ${ids.length} từ chờ định nghĩa tới ${settings.endpoint} để AI tạo nghĩa, ví dụ và chủ đề? Chỉ các từ này được gửi.`)) return
-    setBusy(true)
-    try {
-      const result = await api<{ updatedCount: number; failedCount: number }>('batch_define_vocabulary', { input: { ids } })
-      await loadVocabulary(); await refresh()
-      notify(`AI đã định nghĩa ${result.updatedCount} từ${result.failedCount ? `; ${result.failedCount} từ chưa xong` : ''}.`)
-    } catch (error) { notify(String(error)) } finally { setBusy(false) }
+    const endpoint = settings.endpoint
+    requestConfirmation({
+      title: 'Gửi từ tới AI?',
+      description: <>{ids.length} từ chờ định nghĩa đang xem sẽ được gửi tới <b>{endpoint}</b> để tạo nghĩa, IPA, ví dụ và chủ đề. Không gửi từ khác hay lịch sử ôn.</>,
+      confirmLabel: 'Gửi tới AI',
+      onConfirm: async () => {
+        setBusy(true)
+        try {
+          const result = await api<{ updatedCount: number; failedCount: number }>('batch_define_vocabulary', { input: { ids } })
+          await loadVocabulary(); await refresh()
+          notify(`AI đã định nghĩa ${result.updatedCount} từ${result.failedCount ? `; ${result.failedCount} từ chưa xong` : ''}.`)
+        } catch (error) { notify(String(error)) } finally { setBusy(false) }
+      },
+    })
   }
   const petLabel = useMemo(() => dashboard.dueCount > 0 ? `${dashboard.dueCount} từ chờ ôn` : 'Inbox trống', [dashboard.dueCount])
 
@@ -442,6 +483,7 @@ function App() {
     </section>
 
     {message && <div className="toast" role="alert">{message}</div>}
+    {confirmation && <ConfirmationDialog request={confirmation} running={confirming} onCancel={() => setConfirmation(null)} onConfirm={() => void confirm()} />}
     {modal === 'edit' && editingWord && <Dialog title={`Định nghĩa: ${editingWord.term}`} onClose={() => setModal('inbox')}>
       <div className="term-heading">
         <h3>{editingWord.term}</h3>
@@ -553,6 +595,16 @@ function App() {
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return <label className="field"><span>{label}</span>{children}</label>
+}
+
+function ConfirmationDialog({ request, running, onCancel, onConfirm }: { request: ConfirmationRequest; running: boolean; onCancel: () => void; onConfirm: () => void }) {
+  return <div className="modal-backdrop confirm-backdrop" role="presentation" onMouseDown={() => { if (!running) onCancel() }}>
+    <section className="dialog confirmation-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirmation-title" aria-describedby="confirmation-description" onMouseDown={(event) => event.stopPropagation()}>
+      <header><h2 id="confirmation-title">{request.title}</h2><button disabled={running} onClick={onCancel} aria-label="Đóng">×</button></header>
+      <p id="confirmation-description" className="confirmation-copy">{request.description}</p>
+      <footer><button className="secondary" autoFocus disabled={running} onClick={onCancel}>Hủy</button><button className={request.danger ? 'primary danger' : 'primary'} disabled={running} onClick={onConfirm}>{running ? 'Đang xử lý…' : request.confirmLabel}</button></footer>
+    </section>
+  </div>
 }
 
 function Dialog({ title, children, onClose, wide = false }: { title: string; children: React.ReactNode; onClose: () => void; wide?: boolean }) {
