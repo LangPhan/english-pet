@@ -473,12 +473,12 @@ function App() {
         <button onClick={() => void snooze('hour')}>1 giờ</button>
         <button onClick={() => void snooze('tomorrow')}>Mai 8:00</button>
       </div>}
-      <nav className="pet-actions" aria-label="Pet actions">
-        <button onClick={() => void openReview()}>Ôn</button>
-        <button disabled={Boolean(feedingWord)} onClick={() => void feedWord()}>+ Từ</button>
-        <button onClick={() => void openInbox()} aria-label="Xem từ đã thêm">Từ</button>
-        <button onClick={() => void openSettings()} aria-label="Settings">⚙</button>
-        <button onClick={() => void togglePassthrough()} title="Bật/tắt click xuyên">◎</button>
+      <nav className="pet-actions" aria-label="Chức năng pet">
+        <button data-tooltip="Ôn từ đến hạn" aria-label="Ôn từ đến hạn" onClick={() => void openReview()}>📚</button>
+        <button data-tooltip="Thêm từ" aria-label="Thêm từ" disabled={Boolean(feedingWord)} onClick={() => void feedWord()}>➕</button>
+        <button data-tooltip="Xem từ đã thêm" aria-label="Xem từ đã thêm" onClick={() => void openInbox()}>📖</button>
+        <button data-tooltip="Settings" aria-label="Settings" onClick={() => void openSettings()}>⚙</button>
+        <button data-tooltip="Bật/tắt click xuyên" aria-label="Bật/tắt click xuyên" onClick={() => void togglePassthrough()}>◎</button>
       </nav>
     </section>
 
@@ -562,17 +562,17 @@ function App() {
       </article>}
     </Dialog>}
 
-    {modal === 'inbox' && <Dialog title="Từ vựng đã thêm" onClose={() => setModal(null)} wide>
+    {modal === 'inbox' && <Dialog title="Từ vựng đã thêm" onClose={() => setModal(null)} wide className="inbox-dialog">
       <div className="inbox-tools"><input value={search} onChange={(event) => { const value = event.target.value; setSearch(value); void loadVocabulary(value, topicFilter, 0) }} placeholder="Tìm từ hoặc nghĩa" aria-label="Tìm từ hoặc nghĩa" /><select value={topicFilter} onChange={(event) => { const value = event.target.value as TopicFilter; setTopicFilter(value); void loadVocabulary(search, value, 0) }} aria-label="Lọc chủ đề"><option value="">Tất cả chủ đề</option><option value="unclassified">Chưa phân loại</option>{Object.entries(topics).map(([id, label]) => <option value={id} key={id}>{label}</option>)}</select></div>
       <p className="hint">{vocabulary.total} từ · {vocabulary.unclassifiedCount} từ chưa phân loại</p>
       {vocabulary.items.some((word) => !word.translation) && <button className="secondary" disabled={busy} onClick={() => void definePendingWithAi()}>✨ Định nghĩa AI ({vocabulary.items.filter((word) => !word.translation).length} từ đang xem)</button>}
-      <div className="vocabulary-list">{vocabulary.items.map((word) => <article className="vocabulary-row" key={word.id}><button className="vocabulary-main" onClick={() => openEdit(word)}><div className="vocabulary-title-line"><strong>{word.term}</strong>{word.ipa && <span className="word-ipa">{word.ipa}</span>}</div><span>{word.translation || 'Chờ định nghĩa'}</span></button><div className="vocabulary-actions"><button className="speaker-button small" type="button" aria-label={`Nghe phát âm ${word.term}`} onClick={(e) => { e.stopPropagation(); speak(word.term) }}>🔊</button>{!word.translation && <><button className="secondary small-button" disabled={busy} onClick={() => void defineWithAi(word)}>✨ AI</button><button className="secondary small-button danger" disabled={busy} onClick={() => void deletePendingWord(word)}>Xóa</button></>}<span className={`topic ${!word.translation ? 'topic-pending' : `topic-${word.topic || 'unclassified'}`}`}>{!word.translation ? 'Chờ định nghĩa' : word.topic ? topics[word.topic] : 'Chưa phân loại'}</span></div></article>)}</div>
+      <div className="inbox-scroll"><div className="vocabulary-list">{vocabulary.items.map((word) => <article className="vocabulary-row" key={word.id}><button className="vocabulary-main" onClick={() => openEdit(word)}><div className="vocabulary-title-line"><strong>{word.term}</strong>{word.ipa && <span className="word-ipa">{word.ipa}</span>}</div><span>{word.translation || 'Chờ định nghĩa'}</span></button><div className="vocabulary-actions"><button className="speaker-button small" type="button" aria-label={`Nghe phát âm ${word.term}`} onClick={(e) => { e.stopPropagation(); speak(word.term) }}>🔊</button>{!word.translation && <><button className="secondary small-button" disabled={busy} onClick={() => void defineWithAi(word)}>✨ AI</button><button className="secondary small-button danger" disabled={busy} onClick={() => void deletePendingWord(word)}>Xóa</button></>}<span className={`topic ${!word.translation ? 'topic-pending' : `topic-${word.topic || 'unclassified'}`}`}>{!word.translation ? 'Chờ định nghĩa' : word.topic ? topics[word.topic] : 'Chưa phân loại'}</span></div></article>)}</div>
       {!vocabulary.items.length && <div className="empty"><span>✦</span><h2>Chưa có từ phù hợp</h2><p>Thêm từ mới hoặc đổi bộ lọc.</p></div>}
-      {vocabulary.total > 50 && <footer><button className="secondary" disabled={busy || vocabularyOffset === 0} onClick={() => void loadVocabulary(search, topicFilter, Math.max(0, vocabularyOffset - 50))}>Trước</button><button className="secondary" disabled={busy || vocabularyOffset + 50 >= vocabulary.total} onClick={() => void loadVocabulary(search, topicFilter, vocabularyOffset + 50)}>Sau</button></footer>}
+      {vocabulary.total > 50 && <footer><button className="secondary" disabled={busy || vocabularyOffset === 0} onClick={() => void loadVocabulary(search, topicFilter, Math.max(0, vocabularyOffset - 50))}>Trước</button><button className="secondary" disabled={busy || vocabularyOffset + 50 >= vocabulary.total} onClick={() => void loadVocabulary(search, topicFilter, vocabularyOffset + 50)}>Sau</button></footer>}</div>
     </Dialog>}
 
-    {modal === 'settings' && <Dialog title="Settings" onClose={() => setModal(null)} wide>
-      <Field label="9Router endpoint"><input value={settings.endpoint} onChange={(event) => setSettings({ ...settings, endpoint: event.target.value })} /></Field>
+    {modal === 'settings' && <Dialog title="Settings" onClose={() => setModal(null)} wide className="settings-dialog">
+      <div className="settings-scroll"><Field label="9Router endpoint"><input value={settings.endpoint} onChange={(event) => setSettings({ ...settings, endpoint: event.target.value })} /></Field>
       <Field label="Model"><div className="inline"><input value={settings.model} list="models" onChange={(event) => setSettings({ ...settings, model: event.target.value })} placeholder="Chọn hoặc nhập model ID" /><button className="secondary" disabled={busy} onClick={() => void loadModels()}>Tải models</button></div><datalist id="models">{models.map((model) => <option value={model} key={model} />)}</datalist></Field>
       <Field label="Model chấm phát âm (hỗ trợ audio)"><div className="inline"><input value={settings.audioModel} list="models" onChange={(event) => setSettings({ ...settings, audioModel: event.target.value })} placeholder="Để trống để dùng model ở trên" /></div><small className="field-hint">Chỉ dùng khi model hỗ trợ input_audio. Để trống sẽ dùng model chung.</small></Field>
       <Field label="9Router API key"><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={settings.hasApiKey ? 'Đã lưu an toàn. Nhập để thay hoặc xóa.' : 'Tùy chọn, chỉ nếu 9Router yêu cầu'} /></Field>
@@ -587,7 +587,7 @@ function App() {
         <p>JSON dùng để chuyển dữ liệu. SQLite backup dùng để khôi phục toàn bộ dữ liệu học. Không gồm API key.</p>
         <div className="data-actions"><button className="secondary" disabled={busy} onClick={() => void exportData()}>Export JSON</button><button className="secondary" disabled={busy} onClick={() => void backupSqlite()}>Backup SQLite</button><button className="secondary" disabled={busy} onClick={() => importRef.current?.click()}>Import JSON</button></div>
         <input ref={importRef} className="visually-hidden" type="file" accept="application/json,.json" onChange={(event) => void importData(event)} />
-      </section>
+      </section></div>
       <footer><button className="primary" disabled={busy} onClick={() => void saveSettings()}>{busy ? 'Đang lưu…' : 'Lưu Settings'}</button></footer>
     </Dialog>}
   </main>
@@ -607,8 +607,8 @@ function ConfirmationDialog({ request, running, onCancel, onConfirm }: { request
   </div>
 }
 
-function Dialog({ title, children, onClose, wide = false }: { title: string; children: React.ReactNode; onClose: () => void; wide?: boolean }) {
-  return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}><section className={`dialog ${wide ? 'wide' : ''}`} role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}><header><h2>{title}</h2><button onClick={onClose} aria-label="Đóng">×</button></header>{children}</section></div>
+function Dialog({ title, children, onClose, wide = false, className = '' }: { title: string; children: React.ReactNode; onClose: () => void; wide?: boolean; className?: string }) {
+  return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}><section className={`dialog ${wide ? 'wide' : ''} ${className}`} role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}><header><h2>{title}</h2><button onClick={onClose} aria-label="Đóng">×</button></header>{children}</section></div>
 }
 
 createRoot(document.getElementById('root')!).render(<App />)
