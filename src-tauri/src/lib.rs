@@ -32,6 +32,17 @@ const HOTKEY: &str = "CommandOrControl+Shift+E";
 const REMINDER_COOLDOWN: StdDuration = StdDuration::from_secs(60 * 60);
 const NO_CARD_CHECK: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const WINDOW_MARGIN: i32 = 12;
+const TOPICS: &[&str] = &[
+    "daily_life",
+    "work_tech",
+    "study_academic",
+    "travel_places",
+    "food_dining",
+    "health_sports",
+    "entertainment",
+    "emotions_social",
+    "other",
+];
 
 struct AppState {
     db: Mutex<Connection>,
@@ -54,7 +65,34 @@ struct CapturedWord {
     id: i64,
     term: String,
     translation: Option<String>,
+    topic: Option<String>,
     created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VocabularyItem {
+    id: i64,
+    term: String,
+    translation: Option<String>,
+    topic: Option<String>,
+    due_at: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VocabularyPage {
+    items: Vec<VocabularyItem>,
+    total: i64,
+    unclassified_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizeResult {
+    updated_count: usize,
+    failed_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +127,21 @@ struct SaveWordInput {
     term: String,
     translation: Option<String>,
     example: Option<String>,
+    topic: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListVocabularyInput {
+    search: Option<String>,
+    topic: Option<String>,
+    offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizeVocabularyInput {
+    ids: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +173,12 @@ struct GeneratedContent {
     translation: String,
     example: String,
     exercise: String,
+    topic: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopicAssignments {
+    topics: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -130,6 +189,8 @@ struct ExportVocabulary {
     normalized_term: String,
     translation: Option<String>,
     example: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
     stability: Option<f32>,
     difficulty: Option<f32>,
     due_at: String,
@@ -194,6 +255,20 @@ fn normalize_term(raw: &str) -> Result<(String, String), String> {
     Ok((term.to_lowercase(), term))
 }
 
+fn validate_topic(topic: Option<String>) -> Result<Option<String>, String> {
+    let Some(topic) = topic
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if TOPICS.contains(&topic.as_str()) {
+        Ok(Some(topic))
+    } else {
+        Err("Chủ đề không hợp lệ.".into())
+    }
+}
+
 fn initialize_db(connection: &Connection) -> Result<(), String> {
     connection
         .execute_batch(
@@ -212,6 +287,7 @@ fn initialize_db(connection: &Connection) -> Result<(), String> {
               normalized_term TEXT NOT NULL UNIQUE,
               translation TEXT,
               example TEXT,
+              topic TEXT,
               stability REAL,
               difficulty REAL,
               due_at TEXT NOT NULL,
@@ -233,6 +309,23 @@ fn initialize_db(connection: &Connection) -> Result<(), String> {
             CREATE INDEX IF NOT EXISTS idx_review_logs_word_time ON review_logs(vocabulary_id, reviewed_at);
             ",
         )
+        .map_err(|error| error.to_string())?;
+
+    let has_topic = connection
+        .prepare("PRAGMA table_info(vocabulary)")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .try_fold(false, |found, column| Ok(found || column? == "topic"))
+        })
+        .map_err(|error| error.to_string())?;
+    if !has_topic {
+        connection
+            .execute("ALTER TABLE vocabulary ADD COLUMN topic TEXT", [])
+            .map_err(|error| error.to_string())?;
+    }
+    connection
+        .execute_batch("CREATE INDEX IF NOT EXISTS idx_vocabulary_topic ON vocabulary(topic);")
         .map_err(|error| error.to_string())?;
 
     for (key, value) in [
@@ -635,15 +728,16 @@ fn save_word(state: State<'_, AppState>, input: SaveWordInput) -> Result<Capture
         .example
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_string());
+    let topic = validate_topic(input.topic)?;
     let timestamp = now();
     let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
     transaction.execute(
-        "INSERT INTO vocabulary(term, normalized_term, translation, example, due_at, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5)",
-        params![term, normalized_term, translation, example, timestamp],
+        "INSERT INTO vocabulary(term, normalized_term, translation, example, topic, due_at, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)",
+        params![term, normalized_term, translation, example, topic, timestamp],
     ).map_err(|error| {
         if error.to_string().contains("UNIQUE") { "Từ này đã có trong Inbox.".to_string() } else { error.to_string() }
     })?;
@@ -654,7 +748,197 @@ fn save_word(state: State<'_, AppState>, input: SaveWordInput) -> Result<Capture
         id,
         term,
         translation,
+        topic,
         created_at: timestamp,
+    })
+}
+
+fn list_vocabulary_from_connection(
+    connection: &Connection,
+    input: &ListVocabularyInput,
+) -> Result<VocabularyPage, String> {
+    let search = input.search.as_deref().unwrap_or_default().trim();
+    if search.chars().count() > 100 {
+        return Err("Từ khóa tìm kiếm tối đa 100 ký tự.".into());
+    }
+    let topic = match input.topic.as_deref() {
+        Some("unclassified") => Some("unclassified"),
+        Some(value) if TOPICS.contains(&value) => Some(value),
+        Some(_) => return Err("Bộ lọc chủ đề không hợp lệ.".into()),
+        None => None,
+    };
+    let offset = input.offset.unwrap_or(0).max(0);
+    let pattern = format!("%{search}%");
+    let filter = match topic {
+        Some("unclassified") => "topic IS NULL AND ?2 = ''",
+        Some(_) => "topic = ?2",
+        None => "?2 = ''",
+    };
+    let sql = format!(
+        "SELECT id, term, translation, topic, due_at, created_at FROM vocabulary
+         WHERE (term LIKE ?1 OR COALESCE(translation, '') LIKE ?1) AND {filter}
+         ORDER BY created_at DESC, id DESC LIMIT 50 OFFSET ?3"
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| error.to_string())?;
+    let topic_parameter = topic.filter(|value| *value != "unclassified").unwrap_or("");
+    let items = statement
+        .query_map(params![pattern, topic_parameter, offset], |row| {
+            Ok(VocabularyItem {
+                id: row.get(0)?,
+                term: row.get(1)?,
+                translation: row.get(2)?,
+                topic: row.get(3)?,
+                due_at: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM vocabulary WHERE (term LIKE ?1 OR COALESCE(translation, '') LIKE ?1) AND {filter}"
+    );
+    let total = connection
+        .query_row(&count_sql, params![pattern, topic_parameter], |row| {
+            row.get(0)
+        })
+        .map_err(|error| error.to_string())?;
+    let unclassified_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM vocabulary WHERE topic IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(VocabularyPage {
+        items,
+        total,
+        unclassified_count,
+    })
+}
+
+#[tauri::command]
+fn list_vocabulary(
+    state: State<'_, AppState>,
+    input: ListVocabularyInput,
+) -> Result<VocabularyPage, String> {
+    let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
+    list_vocabulary_from_connection(&connection, &input)
+}
+
+#[tauri::command]
+async fn batch_categorize_vocabulary(
+    state: State<'_, AppState>,
+    input: CategorizeVocabularyInput,
+) -> Result<CategorizeResult, String> {
+    let ids = input
+        .ids
+        .into_iter()
+        .filter(|id| *id > 0)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(CategorizeResult {
+            updated_count: 0,
+            failed_count: 0,
+        });
+    }
+    if ids.len() > 100 {
+        return Err("Mỗi lần chỉ phân loại tối đa 100 từ.".into());
+    }
+    let (endpoint, model, enabled, words) = {
+        let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
+        let mut query = connection
+            .prepare("SELECT id, term FROM vocabulary WHERE id = ?1 AND topic IS NULL")
+            .map_err(|error| error.to_string())?;
+        let words = ids
+            .iter()
+            .filter_map(|id| {
+                query
+                    .query_row([id], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .optional()
+                    .ok()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        (
+            setting(&connection, "endpoint")?,
+            setting(&connection, "model")?,
+            setting(&connection, "ai_enabled")? == "true",
+            words,
+        )
+    };
+    if !enabled {
+        return Err("AI đang tắt trong Settings.".into());
+    }
+    if model.is_empty() {
+        return Err("Chọn model 9Router trong Settings trước.".into());
+    }
+    let mut updated_count = 0;
+    let mut failed_count = 0;
+    for chunk in words.chunks(15) {
+        let terms = chunk.iter().map(|(_, term)| term).collect::<Vec<_>>();
+        let prompt = format!(
+            "Classify each English term into exactly one allowed topic ID: {}. Return only JSON object {{\"topics\": {{\"term\": \"topic_id\"}}}}. Terms: {}",
+            TOPICS.join(", "),
+            serde_json::to_string(&terms).map_err(|error| error.to_string())?
+        );
+        let mut request = state
+            .http
+            .post(format!("{endpoint}/chat/completions"))
+            .json(&json!({
+                "model": model, "stream": false, "response_format": {"type": "json_object"},
+                "messages": [{"role": "user", "content": prompt}], "max_tokens": 250
+            }));
+        if let Some(key) = api_key()? {
+            request = request.bearer_auth(key);
+        }
+        let result = async {
+            let response: Value = request
+                .send()
+                .await
+                .map_err(|error| format!("Không kết nối được 9Router: {error}"))?
+                .error_for_status()
+                .map_err(|error| format!("9Router lỗi: {error}"))?
+                .json()
+                .await
+                .map_err(|error| format!("9Router trả response lỗi: {error}"))?;
+            let content = response["choices"][0]["message"]["content"]
+                .as_str()
+                .ok_or("9Router không trả nội dung.")?;
+            serde_json::from_str::<TopicAssignments>(content)
+                .map_err(|_| "Model trả JSON phân loại không hợp lệ.".to_string())
+        }
+        .await;
+        let Ok(assignments) = result else {
+            failed_count += chunk.len();
+            continue;
+        };
+        let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        for (id, term) in chunk {
+            match assignments
+                .topics
+                .get(term)
+                .cloned()
+                .and_then(|topic| validate_topic(Some(topic)).ok())
+            {
+                Some(topic) => {
+                    updated_count += transaction.execute("UPDATE vocabulary SET topic = ?1, updated_at = ?2 WHERE id = ?3 AND topic IS NULL", params![topic, now(), id]).map_err(|error| error.to_string())?;
+                }
+                None => failed_count += 1,
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+    }
+    Ok(CategorizeResult {
+        updated_count,
+        failed_count,
     })
 }
 
@@ -678,7 +962,7 @@ fn backup_filename(extension: &str) -> String {
 
 fn export_from_connection(connection: &Connection) -> Result<ExportData, String> {
     let mut vocabulary_query = connection.prepare(
-        "SELECT id, term, normalized_term, translation, example, stability, difficulty, due_at, last_reviewed_at, created_at, updated_at
+        "SELECT id, term, normalized_term, translation, example, topic, stability, difficulty, due_at, last_reviewed_at, created_at, updated_at
          FROM vocabulary ORDER BY id",
     ).map_err(|error| error.to_string())?;
     let vocabulary = vocabulary_query
@@ -689,12 +973,13 @@ fn export_from_connection(connection: &Connection) -> Result<ExportData, String>
                 normalized_term: row.get(2)?,
                 translation: row.get(3)?,
                 example: row.get(4)?,
-                stability: row.get(5)?,
-                difficulty: row.get(6)?,
-                due_at: row.get(7)?,
-                last_reviewed_at: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
+                topic: row.get(5)?,
+                stability: row.get(6)?,
+                difficulty: row.get(7)?,
+                due_at: row.get(8)?,
+                last_reviewed_at: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         })
         .map_err(|error| error.to_string())?
@@ -720,7 +1005,7 @@ fn export_from_connection(connection: &Connection) -> Result<ExportData, String>
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     Ok(ExportData {
-        version: 1,
+        version: 2,
         exported_at: now(),
         vocabulary,
         review_logs,
@@ -762,6 +1047,7 @@ fn validate_import_word(word: &ExportVocabulary) -> Result<(String, String), Str
     {
         return Err("Import chứa nghĩa hoặc ví dụ quá dài.".into());
     }
+    validate_topic(word.topic.clone())?;
     parse_due(&word.due_at)?;
     parse_due(&word.created_at)?;
     parse_due(&word.updated_at)?;
@@ -775,8 +1061,10 @@ fn import_into_connection(
     connection: &Connection,
     data: ExportData,
 ) -> Result<ImportResult, String> {
-    if data.version != 1 {
-        return Err("File backup không được hỗ trợ. Cần English Pet export version 1.".into());
+    if !matches!(data.version, 1 | 2) {
+        return Err(
+            "File backup không được hỗ trợ. Cần English Pet export version 1 hoặc 2.".into(),
+        );
     }
     if data.vocabulary.len() > 100_000 || data.review_logs.len() > 1_000_000 {
         return Err("File backup quá lớn.".into());
@@ -804,9 +1092,9 @@ fn import_into_connection(
             continue;
         }
         transaction.execute(
-            "INSERT INTO vocabulary(term, normalized_term, translation, example, stability, difficulty, due_at, last_reviewed_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![term, normalized_term, word.translation, word.example, word.stability, word.difficulty,
+            "INSERT INTO vocabulary(term, normalized_term, translation, example, topic, stability, difficulty, due_at, last_reviewed_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![term, normalized_term, word.translation, word.example, word.topic, word.stability, word.difficulty,
                 word.due_at, word.last_reviewed_at, word.created_at, word.updated_at],
         ).map_err(|error| error.to_string())?;
         if ids
@@ -1028,10 +1316,11 @@ async fn generate_content(
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_owned());
     let prompt = format!(
-        "You help a Vietnamese learner learn English. For the term {term:?}{} return only one JSON object with keys translation, example, exercise. translation: concise Vietnamese meaning. example: natural English sentence at B1 level. exercise: one short cloze question. No markdown.",
+        "You help a Vietnamese learner learn English. For the term {term:?}{} return only one JSON object with keys translation, example, exercise, topic. translation: concise Vietnamese meaning. example: natural English sentence at B1 level. exercise: one short cloze question. topic must be exactly one of: {}. No markdown.",
         known_translation
             .map(|value| format!(" (known Vietnamese meaning: {value:?})"))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        TOPICS.join(", ")
     );
     let mut request = state
         .http
@@ -1067,6 +1356,8 @@ async fn generate_content(
     {
         return Err("Model trả nội dung thiếu trường bắt buộc.".into());
     }
+    validate_topic(Some(generated.topic.clone()))
+        .map_err(|_| "Model trả chủ đề không hợp lệ.".to_string())?;
     Ok(generated)
 }
 
@@ -1087,7 +1378,7 @@ fn set_window_mode(app: AppHandle, state: State<'_, AppState>, mode: String) -> 
         .ok_or("Pet window unavailable")?;
     let (width, height) = match mode.as_str() {
         "capture" | "review" => (460.0, 620.0),
-        "settings" => (580.0, 800.0),
+        "settings" | "inbox" => (580.0, 800.0),
         "pet" => {
             let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
             pet_dimensions(&setting(&connection, "pet_size").unwrap_or_else(|_| "medium".into()))
@@ -1215,6 +1506,8 @@ pub fn run() {
             save_settings,
             capture_clipboard,
             save_word,
+            list_vocabulary,
+            batch_categorize_vocabulary,
             export_data,
             backup_sqlite,
             import_data,
@@ -1266,13 +1559,103 @@ mod tests {
     }
 
     #[test]
-    fn json_export_import_keeps_word_and_review_state() {
+    fn initialize_db_migrates_existing_vocabulary() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE vocabulary (
+                    id INTEGER PRIMARY KEY, term TEXT NOT NULL, normalized_term TEXT NOT NULL UNIQUE,
+                    translation TEXT, example TEXT, stability REAL, difficulty REAL, due_at TEXT NOT NULL,
+                    last_reviewed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                INSERT INTO vocabulary(term, normalized_term, due_at, created_at, updated_at)
+                VALUES ('hello', 'hello', '2026-10-04T00:00:00+00:00', '2026-10-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00');",
+            )
+            .unwrap();
+
+        initialize_db(&connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT topic FROM vocabulary WHERE term = 'hello'",
+                    [],
+                    |row| { row.get::<_, Option<String>>(0) }
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn vocabulary_listing_filters_and_paginates() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_db(&connection).unwrap();
+        for index in 0..51 {
+            let term = format!("word {index}");
+            let topic = if index == 50 { Some("work_tech") } else { None };
+            connection
+                .execute(
+                    "INSERT INTO vocabulary(term, normalized_term, translation, topic, due_at, created_at, updated_at)
+                     VALUES (?1, ?1, ?2, ?3, ?4, ?4, ?4)",
+                    params![term, format!("nghĩa {index}"), topic, format!("2026-10-04T00:00:{index:02}+00:00")],
+                )
+                .unwrap();
+        }
+
+        let first_page = list_vocabulary_from_connection(
+            &connection,
+            &ListVocabularyInput {
+                search: None,
+                topic: None,
+                offset: None,
+            },
+        )
+        .unwrap();
+        let second_page = list_vocabulary_from_connection(
+            &connection,
+            &ListVocabularyInput {
+                search: None,
+                topic: None,
+                offset: Some(50),
+            },
+        )
+        .unwrap();
+        let unclassified = list_vocabulary_from_connection(
+            &connection,
+            &ListVocabularyInput {
+                search: Some("nghĩa".into()),
+                topic: Some("unclassified".into()),
+                offset: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first_page.total, 51);
+        assert_eq!(first_page.items.len(), 50);
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(unclassified.total, 50);
+        assert_eq!(unclassified.unclassified_count, 50);
+    }
+
+    #[test]
+    fn topic_validation_only_accepts_taxonomy() {
+        assert_eq!(
+            validate_topic(Some("work_tech".into())).unwrap().as_deref(),
+            Some("work_tech")
+        );
+        assert_eq!(validate_topic(Some(" ".into())).unwrap(), None);
+        assert!(validate_topic(Some("custom topic".into())).is_err());
+    }
+
+    #[test]
+    fn json_export_import_keeps_word_review_and_topic() {
         let source = Connection::open_in_memory().unwrap();
         initialize_db(&source).unwrap();
         source.execute(
-            "INSERT INTO vocabulary(term, normalized_term, translation, example, stability, difficulty, due_at, last_reviewed_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params!["take care", "take care", "chăm sóc", "Take care.", 2.5_f32, 4.0_f32,
+            "INSERT INTO vocabulary(term, normalized_term, translation, example, topic, stability, difficulty, due_at, last_reviewed_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params!["take care", "take care", "chăm sóc", "Take care.", "daily_life", 2.5_f32, 4.0_f32,
                 "2026-10-04T00:00:00+00:00", "2026-10-03T00:00:00+00:00", "2026-10-01T00:00:00+00:00", "2026-10-03T00:00:00+00:00"],
         ).unwrap();
         source.execute(
@@ -1281,26 +1664,53 @@ mod tests {
             params!["2026-10-03T00:00:00+00:00", r#"{"stability":1.0,"difficulty":5.0}"#, r#"{"stability":2.5,"difficulty":4.0}"#],
         ).unwrap();
 
+        let export = export_from_connection(&source).unwrap();
+        assert_eq!(export.version, 2);
         let destination = Connection::open_in_memory().unwrap();
         initialize_db(&destination).unwrap();
-        let result =
-            import_into_connection(&destination, export_from_connection(&source).unwrap()).unwrap();
+        let result = import_into_connection(&destination, export).unwrap();
 
         assert_eq!(result.imported_words, 1);
         assert_eq!(result.imported_reviews, 1);
         assert_eq!(
             destination
-                .query_row("SELECT COUNT(*) FROM vocabulary", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            1
+                .query_row("SELECT topic FROM vocabulary", [], |row| row
+                    .get::<_, Option<String>>(0))
+                .unwrap()
+                .as_deref(),
+            Some("daily_life")
         );
+    }
+
+    #[test]
+    fn version_one_import_keeps_words_unclassified() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_db(&connection).unwrap();
+        let data: ExportData = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "exportedAt": "2026-10-04T00:00:00+00:00",
+                "vocabulary": [{
+                    "id": 1, "term": "travel", "normalizedTerm": "travel", "translation": "du lịch",
+                    "example": null, "stability": null, "difficulty": null,
+                    "dueAt": "2026-10-04T00:00:00+00:00", "lastReviewedAt": null,
+                    "createdAt": "2026-10-01T00:00:00+00:00", "updatedAt": "2026-10-01T00:00:00+00:00"
+                }],
+                "reviewLogs": []
+            }"#,
+        )
+        .unwrap();
+
+        import_into_connection(&connection, data).unwrap();
         assert_eq!(
-            destination
-                .query_row("SELECT COUNT(*) FROM review_logs", [], |row| row
-                    .get::<_, i64>(0))
+            connection
+                .query_row(
+                    "SELECT topic FROM vocabulary WHERE term = 'travel'",
+                    [],
+                    |row| { row.get::<_, Option<String>>(0) }
+                )
                 .unwrap(),
-            1
+            None
         );
     }
 
@@ -1311,7 +1721,7 @@ mod tests {
         let result = import_into_connection(
             &connection,
             ExportData {
-                version: 2,
+                version: 3,
                 exported_at: now(),
                 vocabulary: Vec::new(),
                 review_logs: Vec::new(),

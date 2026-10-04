@@ -8,7 +8,9 @@ English Pet reads clipboard text only after user explicitly presses `Ctrl+Shift+
 
 ## AI and 9Router
 
-AI is optional. Pressing **Tạo bằng AI** sends only current term and optional meaning to configured 9Router endpoint. The default is local `http://localhost:20128/v1`.
+AI is optional. Pressing **Tạo bằng AI** sends only current term and optional meaning to configured 9Router endpoint, then returns example, exercise, and one fixed topic. The default is local `http://localhost:20128/v1`.
+
+Viewing, searching, and filtering the local vocabulary Inbox never sends data over the network. **Phân loại AI** only sends the explicitly confirmed unclassified terms currently shown in Inbox; it never runs automatically or sends review logs, statistics, or the full database.
 
 Do not use a remote endpoint unless you accept its operator and downstream AI providers may process that content. 9Router controls its own request logging and provider configuration; check its settings before use.
 
@@ -16,7 +18,7 @@ Do not use a remote endpoint unless you accept its operator and downstream AI pr
 
 ## Backup and restore
 
-In Settings, **Export JSON** writes a versioned vocabulary and FSRS review-history export to `Documents\English Pet Backups`. **Backup SQLite** writes a consistent SQLite snapshot to same folder using SQLite's online backup API. Neither file includes 9Router API key. Release builds ship both per-user NSIS and MSI installers; neither uninstaller removes local learning data or backups automatically.
+In Settings, **Export JSON** writes a version 2 vocabulary, optional topic, and FSRS review-history export to `Documents\English Pet Backups`; English Pet still imports version 1 exports. **Backup SQLite** writes a consistent SQLite snapshot to same folder using SQLite's online backup API. Neither file includes 9Router API key. Release builds ship both per-user NSIS and MSI installers; neither uninstaller removes local learning data or backups automatically.
 
 Import JSON adds only terms not already present, skips duplicate normalized terms, and imports review history only for words added by same import. It never replaces existing cards. Import validates version, size, dates, ratings, and FSRS state before one database transaction commits.
 
