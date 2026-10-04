@@ -232,12 +232,16 @@ function App() {
         setFeedPhase('chewing')
         try {
           await api('save_word', { input: { term: capturedTerm, ipa: null, translation: null, example: null, topic: null } })
-          setFeedPhase('happy'); await refresh(); notify('Corgi đã nuốt từ mới. Mở Inbox để định nghĩa.')
+          await refresh()
+          window.setTimeout(() => {
+            speak(capturedTerm)
+            setFeedPhase('happy')
+            window.setTimeout(() => { setFeedPhase(null); setFeedingWord(null) }, 2_000)
+          }, 900)
         } catch (error) {
-          notify(String(error)); setFeedPhase(null); setFeedingWord(null); return
+          notify(String(error)); setFeedPhase(null); setFeedingWord(null)
         }
-        window.setTimeout(() => { setFeedPhase(null); setFeedingWord(null) }, 550)
-      }, 450)
+      }, 700)
     } catch (error) { notify(String(error)) }
   }
   const openEdit = (word: VocabularyItem) => {
