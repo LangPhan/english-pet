@@ -24,6 +24,48 @@ use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_global_shortcut::ShortcutState;
 use tauri_plugin_notification::NotificationExt;
 
+#[cfg(target_os = "windows")]
+const VK_CONTROL: i32 = 0x11;
+#[cfg(target_os = "windows")]
+const VK_SHIFT: i32 = 0x10;
+#[cfg(target_os = "windows")]
+const VK_C: u16 = 0x43;
+#[cfg(target_os = "windows")]
+const KEYEVENTF_KEYUP: u32 = 0x0002;
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct WindowsInput {
+    input_type: u32,
+    data: WindowsInputData,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+union WindowsInputData {
+    keyboard: WindowsKeyboardInput,
+    mouse_layout: [u64; 4],
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WindowsKeyboardInput {
+    virtual_key: u16,
+    scan_code: u16,
+    flags: u32,
+    time: u32,
+    extra_info: usize,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetAsyncKeyState(virtual_key: i32) -> i16;
+    fn GetClipboardSequenceNumber() -> u32;
+    fn SendInput(input_count: u32, inputs: *const WindowsInput, input_size: i32) -> u32;
+}
+
 const SERVICE_NAME: &str = "English Pet";
 const SECRET_NAME: &str = "9router-api-key";
 const DEFAULT_ENDPOINT: &str = "http://localhost:20128/v1";
@@ -270,6 +312,74 @@ fn normalize_term(raw: &str) -> Result<(String, String), String> {
         return Err("Chỉ lưu một từ hoặc cụm từ ngắn.".into());
     }
     Ok((term.to_lowercase(), term))
+}
+
+#[cfg(target_os = "windows")]
+fn selection_capture() -> Result<String, String> {
+    for _ in 0..20 {
+        let modifiers_down =
+            unsafe { GetAsyncKeyState(VK_CONTROL) < 0 || GetAsyncKeyState(VK_SHIFT) < 0 };
+        if !modifiers_down {
+            break;
+        }
+        thread::sleep(StdDuration::from_millis(15));
+    }
+    let modifiers_down =
+        unsafe { GetAsyncKeyState(VK_CONTROL) < 0 || GetAsyncKeyState(VK_SHIFT) < 0 };
+    if modifiers_down {
+        return Err("Hãy nhả Ctrl và Shift rồi thử lại.".into());
+    }
+
+    let before = unsafe { GetClipboardSequenceNumber() };
+    let key = |virtual_key, flags| WindowsInput {
+        input_type: 1,
+        data: WindowsInputData {
+            keyboard: WindowsKeyboardInput {
+                virtual_key,
+                scan_code: 0,
+                flags,
+                time: 0,
+                extra_info: 0,
+            },
+        },
+    };
+    let inputs = [
+        key(VK_CONTROL as u16, 0),
+        key(VK_C, 0),
+        key(VK_C, KEYEVENTF_KEYUP),
+        key(VK_CONTROL as u16, KEYEVENTF_KEYUP),
+    ];
+    let sent = unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            std::mem::size_of::<WindowsInput>() as i32,
+        )
+    };
+    if sent != inputs.len() as u32 {
+        return Err("Không thể copy vùng bôi đen. Hãy thử lại ở ứng dụng đang chọn text.".into());
+    }
+
+    for _ in 0..20 {
+        thread::sleep(StdDuration::from_millis(15));
+        if unsafe { GetClipboardSequenceNumber() } == before {
+            continue;
+        }
+        let mut clipboard =
+            Clipboard::new().map_err(|error| format!("Không mở được clipboard: {error}"))?;
+        let text = clipboard.get_text().map_err(|_| {
+            "Vùng bôi đen không chứa text có thể copy. Hãy chọn từ hoặc cụm từ ngắn rồi thử lại."
+                .to_string()
+        })?;
+        let (_, term) = normalize_term(&text)?;
+        return Ok(term);
+    }
+    Err("Không nhận được text mới từ vùng bôi đen. Hãy chọn từ rồi thử lại.".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn selection_capture() -> Result<String, String> {
+    Err("Chụp text đang bôi đen chỉ hỗ trợ Windows.".into())
 }
 
 fn validate_topic(topic: Option<String>) -> Result<Option<String>, String> {
@@ -727,9 +837,10 @@ fn save_settings(
 fn capture_clipboard() -> Result<String, String> {
     let mut clipboard =
         Clipboard::new().map_err(|error| format!("Không mở được clipboard: {error}"))?;
-    let text = clipboard
-        .get_text()
-        .map_err(|_| "Clipboard không có text. Hãy copy từ trước.".to_string())?;
+    let text = clipboard.get_text().map_err(|_| {
+        "Clipboard không có text. Hãy copy từ trước hoặc bôi đen text rồi bấm Ctrl+Shift+E."
+            .to_string()
+    })?;
     let (_, term) = normalize_term(&text)?;
     Ok(term)
 }
@@ -899,6 +1010,31 @@ fn update_word(state: State<'_, AppState>, input: UpdateWordInput) -> Result<(),
     if updated == 0 {
         return Err("Không tìm thấy từ trong Inbox.".into());
     }
+    drop(connection);
+    reschedule_reminder(&state);
+    Ok(())
+}
+
+fn delete_pending_word_from_connection(connection: &Connection, id: i64) -> Result<(), String> {
+    if id <= 0 {
+        return Err("ID từ không hợp lệ.".into());
+    }
+    let deleted = connection
+        .execute(
+            "DELETE FROM vocabulary WHERE id = ?1 AND (translation IS NULL OR trim(translation) = '')",
+            [id],
+        )
+        .map_err(|error| error.to_string())?;
+    if deleted == 0 {
+        return Err("Chỉ có thể xóa từ chờ định nghĩa.".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_pending_word(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
+    delete_pending_word_from_connection(&connection, id)?;
     drop(connection);
     reschedule_reminder(&state);
     Ok(())
@@ -1498,7 +1634,7 @@ fn show_pet(app: &AppHandle) {
 
 fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let review = MenuItem::with_id(app, "review", "Ôn từ đến hạn", true, None::<&str>)?;
-    let capture = MenuItem::with_id(app, "capture", "Thêm từ từ clipboard", true, Some(HOTKEY))?;
+    let capture = MenuItem::with_id(app, "capture", "Thêm từ từ clipboard", true, None::<&str>)?;
     let passthrough = MenuItem::with_id(
         app,
         "passthrough",
@@ -1548,8 +1684,16 @@ pub fn run() {
                 .expect("valid hotkey")
                 .with_handler(|app, _, event| {
                     if event.state == ShortcutState::Pressed {
-                        let _ = app.emit("capture-clipboard", ());
-                        show_pet(app);
+                        let app = app.clone();
+                        thread::spawn(move || match selection_capture() {
+                            Ok(term) => {
+                                let _ = app.emit("capture-selection", term);
+                                show_pet(&app);
+                            }
+                            Err(error) => {
+                                let _ = app.emit("capture-error", error);
+                            }
+                        });
                     }
                 })
                 .build(),
@@ -1599,6 +1743,7 @@ pub fn run() {
             save_word,
             list_vocabulary,
             update_word,
+            delete_pending_word,
             batch_define_vocabulary,
             export_data,
             backup_sqlite,
@@ -1765,6 +1910,35 @@ mod tests {
             .optional()
             .unwrap();
         assert!(defined.is_some());
+    }
+
+    #[test]
+    fn delete_only_removes_pending_words() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_db(&connection).unwrap();
+        let timestamp = "2026-10-04T00:00:00+00:00";
+        connection
+            .execute(
+                "INSERT INTO vocabulary(term, normalized_term, due_at, created_at, updated_at)
+                 VALUES ('pending', 'pending', ?1, ?1, ?1)",
+                [timestamp],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO vocabulary(term, normalized_term, translation, due_at, created_at, updated_at)
+                 VALUES ('defined', 'defined', 'đã định nghĩa', ?1, ?1, ?1)",
+                [timestamp],
+            )
+            .unwrap();
+
+        delete_pending_word_from_connection(&connection, 1).unwrap();
+        assert!(delete_pending_word_from_connection(&connection, 2).is_err());
+        assert!(delete_pending_word_from_connection(&connection, 0).is_err());
+        let remaining: String = connection
+            .query_row("SELECT term FROM vocabulary", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, "defined");
     }
 
     #[test]

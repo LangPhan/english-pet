@@ -4,7 +4,7 @@ English Pet stores vocabulary, FSRS state, and review logs in SQLite under Windo
 
 ## Clipboard
 
-English Pet reads clipboard text only after user explicitly presses `Ctrl+Shift+E`, clicks **+ Từ**, or chooses **Thêm từ từ clipboard** in tray. It animates that text on a bone into Corgi, then saves it locally in Inbox as **Chờ định nghĩa**. It does not watch clipboard continuously, inspect selected text, or record keystrokes.
+When user explicitly presses `Ctrl+Shift+E`, English Pet waits for shortcut keys to release, sends one Windows copy command to focused highlighted text, then reads only resulting text locally. Copied selection remains on clipboard, same as a normal copy. Clicking **+ Từ** or choosing **Thêm từ từ clipboard** in tray reads existing clipboard text instead. It animates text on a bone into Corgi, then saves it locally in Inbox as **Chờ định nghĩa**. It does not continuously watch clipboard or selections, record keystrokes, use UI Automation, or use OCR.
 
 ## AI and 9Router
 
@@ -23,5 +23,7 @@ In Settings, **Export JSON** writes a version 2 vocabulary, optional topic, and 
 Import JSON adds only terms not already present, skips duplicate normalized terms, and imports review history only for words added by same import. It never replaces existing cards. Import validates version, size, dates, ratings, and FSRS state before one database transaction commits.
 
 ## Delete data
+
+Inbox can delete only words still marked **Chờ định nghĩa**; defined or reviewed cards cannot be deleted there. This deletion stays local and sends no data over network.
 
 Uninstall removes application files but may leave learning data in Windows app data and files in `Documents\English Pet Backups`. To erase local learning data, quit English Pet then delete its Windows app-data folder and optional backup folder. Delete API key in Settings by clearing field and saving.

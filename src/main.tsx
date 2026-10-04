@@ -135,6 +135,8 @@ function App() {
   useEffect(() => {
     void refresh()
     const unlisten = Promise.all([
+      listen<string>('capture-selection', ({ payload }) => void feedWord(payload)),
+      listen<string>('capture-error', ({ payload }) => notify(payload)),
       listen('capture-clipboard', () => void feedWord()),
       listen('open-review', () => void openReview()),
       listen<number>('review-reminder', () => {
@@ -150,7 +152,7 @@ function App() {
     event.preventDefault()
     setDragging(false)
     const dropped = event.dataTransfer.getData('text/plain').trim()
-    if (!dropped) { notify('Không nhận được text. Copy từ rồi bấm Ctrl+Shift+E.'); return }
+    if (!dropped) { notify('Không nhận được text. Bôi đen text rồi bấm Ctrl+Shift+E.'); return }
     void feedWord(dropped)
   }
   const dragWindow = (event: React.PointerEvent) => {
@@ -178,6 +180,14 @@ function App() {
       const content = await api<Generated>('generate_content', { input: { term: word.term, translation: word.translation || null } })
       await api('update_word', { input: { id: word.id, translation: content.translation, example: content.example, topic: content.topic } })
       await loadVocabulary(); await refresh(); notify(`AI đã định nghĩa “${word.term}”.`)
+    } catch (error) { notify(String(error)) } finally { setBusy(false) }
+  }
+  const deletePendingWord = async (word: VocabularyItem) => {
+    if (!window.confirm(`Xóa “${word.term}” khỏi danh sách chờ định nghĩa?`)) return
+    setBusy(true)
+    try {
+      await api('delete_pending_word', { id: word.id })
+      await loadVocabulary(); await refresh(); notify(`Đã xóa “${word.term}”.`)
     } catch (error) { notify(String(error)) } finally { setBusy(false) }
   }
   const rate = async (rating: number) => {
@@ -262,7 +272,7 @@ function App() {
     >
       <div className="speech" role="status">
         <strong>{petLabel}</strong>
-        <span>{dashboard.dueCount > 0 ? 'Bấm để ôn 1 phút' : 'Copy từ rồi bấm Ctrl + Shift + E'}</span>
+        <span>{dashboard.dueCount > 0 ? 'Bấm để ôn 1 phút' : 'Bôi đen text rồi bấm Ctrl + Shift + E'}</span>
       </div>
       {feedingWord && <span className="bone" aria-hidden="true"><span>{feedingWord}</span></span>}
       <button className="pet corgi" aria-label="Ôn từ đến hạn" onClick={() => void openReview()}>
@@ -312,7 +322,7 @@ function App() {
       <div className="inbox-tools"><input value={search} onChange={(event) => { const value = event.target.value; setSearch(value); void loadVocabulary(value, topicFilter, 0) }} placeholder="Tìm từ hoặc nghĩa" aria-label="Tìm từ hoặc nghĩa" /><select value={topicFilter} onChange={(event) => { const value = event.target.value as TopicFilter; setTopicFilter(value); void loadVocabulary(search, value, 0) }} aria-label="Lọc chủ đề"><option value="">Tất cả chủ đề</option><option value="unclassified">Chưa phân loại</option>{Object.entries(topics).map(([id, label]) => <option value={id} key={id}>{label}</option>)}</select></div>
       <p className="hint">{vocabulary.total} từ · {vocabulary.unclassifiedCount} từ chưa phân loại</p>
       {vocabulary.items.some((word) => !word.translation) && <button className="secondary" disabled={busy} onClick={() => void definePendingWithAi()}>✨ Định nghĩa AI ({vocabulary.items.filter((word) => !word.translation).length} từ đang xem)</button>}
-      <div className="vocabulary-list">{vocabulary.items.map((word) => <article className="vocabulary-row" key={word.id}><button className="vocabulary-main" onClick={() => openEdit(word)}><strong>{word.term}</strong><span>{word.translation || 'Chờ định nghĩa'}</span></button><div className="vocabulary-actions">{!word.translation && <button className="secondary small-button" disabled={busy} onClick={() => void defineWithAi(word)}>✨ AI</button>}<span className={`topic ${!word.translation ? 'topic-pending' : `topic-${word.topic || 'unclassified'}`}`}>{!word.translation ? 'Chờ định nghĩa' : word.topic ? topics[word.topic] : 'Chưa phân loại'}</span></div></article>)}</div>
+      <div className="vocabulary-list">{vocabulary.items.map((word) => <article className="vocabulary-row" key={word.id}><button className="vocabulary-main" onClick={() => openEdit(word)}><strong>{word.term}</strong><span>{word.translation || 'Chờ định nghĩa'}</span></button><div className="vocabulary-actions">{!word.translation && <><button className="secondary small-button" disabled={busy} onClick={() => void defineWithAi(word)}>✨ AI</button><button className="secondary small-button danger" disabled={busy} onClick={() => void deletePendingWord(word)}>Xóa</button></>}<span className={`topic ${!word.translation ? 'topic-pending' : `topic-${word.topic || 'unclassified'}`}`}>{!word.translation ? 'Chờ định nghĩa' : word.topic ? topics[word.topic] : 'Chưa phân loại'}</span></div></article>)}</div>
       {!vocabulary.items.length && <div className="empty"><span>✦</span><h2>Chưa có từ phù hợp</h2><p>Thêm từ mới hoặc đổi bộ lọc.</p></div>}
       {vocabulary.total > 50 && <footer><button className="secondary" disabled={busy || vocabularyOffset === 0} onClick={() => void loadVocabulary(search, topicFilter, Math.max(0, vocabularyOffset - 50))}>Trước</button><button className="secondary" disabled={busy || vocabularyOffset + 50 >= vocabulary.total} onClick={() => void loadVocabulary(search, topicFilter, vocabularyOffset + 50)}>Sau</button></footer>}
     </Dialog>}
