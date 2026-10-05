@@ -95,10 +95,17 @@ struct AppState {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct RoamStep {
+    hit_edge: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Dashboard {
     due_count: i64,
     total_words: i64,
     next_due_at: Option<String>,
+    due_word: Option<String>,
     pet_passthrough: bool,
 }
 
@@ -586,7 +593,7 @@ fn pet_scale(connection: &Connection) -> f32 {
     if let Ok(scale) = setting(connection, "pet_scale")
         .and_then(|value| value.parse::<f32>().map_err(|error| error.to_string()))
     {
-        if scale.is_finite() && (0.4..=1.25).contains(&scale) {
+        if scale.is_finite() && (0.1..=1.25).contains(&scale) {
             return scale;
         }
     }
@@ -608,12 +615,43 @@ fn legacy_pet_size(scale: f32) -> &'static str {
 }
 
 fn pet_dimensions(scale: f32) -> (f64, f64) {
-    let side = (280.0 * f64::from(scale)).round();
-    (side, side)
+    // ponytail: keep compact canvas room for menu; shrink only the pixel artwork below 100%.
+    ((200.0 * f64::from(scale)).round().max(180.0), 140.0)
+}
+
+fn roam_bounds(
+    work_area: tauri::PhysicalRect<i32, u32>,
+    window_size: tauri::PhysicalSize<u32>,
+) -> (i32, i32, i32) {
+    let min_x = work_area.position.x;
+    let max_x = work_area.position.x + work_area.size.width as i32 - window_size.width as i32;
+    let floor_y = work_area.position.y + work_area.size.height as i32 - window_size.height as i32;
+    (min_x, max_x.max(min_x), floor_y)
 }
 
 fn clamp_coordinate(value: i32, minimum: i32, maximum: i32) -> i32 {
     value.clamp(minimum, maximum.max(minimum))
+}
+
+fn fit_pet_window(window: &tauri::WebviewWindow, scale: f32) -> Result<(), String> {
+    let monitor = window
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .ok_or("Không tìm thấy màn hình.")?;
+    let (width, height) = pet_dimensions(scale);
+    window
+        .set_size(LogicalSize::new(width, height))
+        .map_err(|error| error.to_string())?;
+    let size = window.outer_size().map_err(|error| error.to_string())?;
+    let current = window.outer_position().map_err(|error| error.to_string())?;
+    let (min_x, max_x, floor_y) = roam_bounds(*monitor.work_area(), size);
+    window
+        .set_position(PhysicalPosition::new(
+            clamp_coordinate(current.x, min_x, max_x),
+            floor_y,
+        ))
+        .map_err(|error| error.to_string())
 }
 
 fn fit_window(window: &tauri::WebviewWindow, width: f64, height: f64) -> Result<(), String> {
@@ -810,7 +848,7 @@ fn dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
     let due_count = connection
         .query_row(
             "SELECT COUNT(*) FROM vocabulary WHERE due_at <= ?1 AND translation IS NOT NULL AND trim(translation) != ''",
-            [current_time],
+            [&current_time],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
@@ -825,11 +863,24 @@ fn dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
         )
         .optional()
         .map_err(|error| error.to_string())?;
+    let due_word = if due_count > 0 {
+        connection
+            .query_row(
+                "SELECT term FROM vocabulary WHERE due_at <= ?1 AND translation IS NOT NULL AND trim(translation) != '' ORDER BY due_at, id LIMIT 1",
+                [&current_time],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
     let pet_passthrough = setting(&connection, "pet_passthrough")? == "true";
     Ok(Dashboard {
         due_count,
         total_words,
         next_due_at,
+        due_word,
         pet_passthrough,
     })
 }
@@ -884,8 +935,8 @@ fn save_settings(
     if input.quiet_hours_start > 23 || input.quiet_hours_end > 23 {
         return Err("Giờ yên lặng không hợp lệ.".into());
     }
-    if !input.pet_scale.is_finite() || !(0.4..=1.25).contains(&input.pet_scale) {
-        return Err("Kích thước pet phải nằm trong 40% đến 125%.".into());
+    if !input.pet_scale.is_finite() || !(0.1..=1.25).contains(&input.pet_scale) {
+        return Err("Kích thước pet phải nằm trong 10% đến 125%.".into());
     }
     if !input.pet_opacity.is_finite() || !(0.2..=1.0).contains(&input.pet_opacity) {
         return Err("Độ trong suốt phải nằm trong 20% đến 100%.".into());
@@ -941,8 +992,7 @@ fn save_settings(
     let window = app
         .get_webview_window("main")
         .ok_or("Pet window unavailable")?;
-    let (width, height) = pet_dimensions(input.pet_scale);
-    fit_window(&window, width, height)?;
+    fit_pet_window(&window, input.pet_scale)?;
     reschedule_reminder(&state);
     Ok(())
 }
@@ -1816,11 +1866,37 @@ fn set_window_mode(app: AppHandle, state: State<'_, AppState>, mode: String) -> 
         "settings" | "inbox" | "edit" => (580.0, 800.0),
         "pet" => {
             let connection = state.db.lock().map_err(|_| "Database busy".to_string())?;
-            pet_dimensions(pet_scale(&connection))
+            return fit_pet_window(&window, pet_scale(&connection));
         }
         _ => return Err("Chế độ cửa sổ không hợp lệ.".into()),
     };
     fit_window(&window, width, height)
+}
+
+#[tauri::command]
+fn step_pet_roam(app: AppHandle, delta_x: i32, jump_offset: i32) -> Result<RoamStep, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or("Pet window unavailable")?;
+    let monitor = window
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .ok_or("Không tìm thấy màn hình.")?;
+    let scale = monitor.scale_factor();
+    let window_size = window.outer_size().map_err(|error| error.to_string())?;
+    let current = window.outer_position().map_err(|error| error.to_string())?;
+    let (min_x, max_x, floor_y) = roam_bounds(*monitor.work_area(), window_size);
+    let target_x = current.x + (f64::from(delta_x) * scale).round() as i32;
+    let hit_edge = target_x <= min_x || target_x >= max_x;
+    let jump = (f64::from(jump_offset.max(0)) * scale).round() as i32;
+    window
+        .set_position(PhysicalPosition::new(
+            clamp_coordinate(target_x, min_x, max_x),
+            floor_y - jump,
+        ))
+        .map_err(|error| error.to_string())?;
+    Ok(RoamStep { hit_edge })
 }
 
 fn set_passthrough(app: &AppHandle, enabled: bool) -> Result<(), String> {
@@ -1934,8 +2010,7 @@ pub fn run() {
                 })
                 .unwrap_or((false, 1.0));
             if let Some(window) = app.get_webview_window("main") {
-                let (width, height) = pet_dimensions(scale);
-                let _ = fit_window(&window, width, height);
+                let _ = fit_pet_window(&window, scale);
             }
             if passthrough {
                 let _ = set_passthrough(app.handle(), true);
@@ -1963,7 +2038,8 @@ pub fn run() {
             generate_content,
             evaluate_pronunciation,
             toggle_passthrough,
-            set_window_mode
+            set_window_mode,
+            step_pet_roam
         ])
         .build(context)
         .expect("error while building Tauri application")
@@ -1985,19 +2061,35 @@ mod tests {
         upsert_setting(&connection, "pet_size", "small").unwrap();
         assert_eq!(pet_scale(&connection), 0.8);
 
-        upsert_setting(&connection, "pet_scale", "0.4").unwrap();
-        assert_eq!(pet_scale(&connection), 0.4);
-        upsert_setting(&connection, "pet_scale", "0.39").unwrap();
+        upsert_setting(&connection, "pet_scale", "0.1").unwrap();
+        assert_eq!(pet_scale(&connection), 0.1);
+        upsert_setting(&connection, "pet_scale", "0.09").unwrap();
         assert_eq!(pet_scale(&connection), 0.8);
     }
 
     #[test]
-    fn pet_dimensions_match_slider_bounds() {
-        assert_eq!(pet_dimensions(0.4), (112.0, 112.0));
-        assert_eq!(pet_dimensions(1.25), (350.0, 350.0));
-        assert_eq!(legacy_pet_size(0.4), "small");
+    fn pet_dimensions_keep_compact_menu_canvas() {
+        assert_eq!(pet_dimensions(0.1), (180.0, 140.0));
+        assert_eq!(pet_dimensions(1.25), (250.0, 140.0));
+        assert_eq!(legacy_pet_size(0.1), "small");
         assert_eq!(legacy_pet_size(1.0), "medium");
         assert_eq!(legacy_pet_size(1.25), "large");
+    }
+
+    #[test]
+    fn roam_bounds_keep_window_above_taskbar_and_on_screen() {
+        let work_area = tauri::PhysicalRect {
+            position: PhysicalPosition::new(-1920, 0),
+            size: tauri::PhysicalSize::new(1920, 1040),
+        };
+        assert_eq!(
+            roam_bounds(work_area, tauri::PhysicalSize::new(200, 140)),
+            (-1920, -200, 900)
+        );
+        assert_eq!(
+            roam_bounds(work_area, tauri::PhysicalSize::new(2_000, 140)),
+            (-1920, -1920, 900)
+        );
     }
 
     #[test]

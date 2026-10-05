@@ -1,14 +1,21 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
+import corgiJump from './assets/corgi-jump.svg'
+import corgiLie from './assets/corgi-lie.svg'
+import corgiRun from './assets/corgi-run.svg'
+import corgiRun2 from './assets/corgi-run-2.svg'
+import corgiSit from './assets/corgi-sit.svg'
+import corgiSleep from './assets/corgi-sleep.svg'
 import './styles.css'
 
 type Dashboard = {
   dueCount: number
   totalWords: number
   nextDueAt: string | null
+  dueWord: string | null
   petPassthrough: boolean
 }
 
@@ -43,7 +50,9 @@ type TopicFilter = Topic | 'unclassified' | ''
 type VocabularyItem = { id: number; term: string; ipa: string | null; translation: string | null; example: string | null; topic: Topic | null; dueAt: string; createdAt: string }
 type VocabularyPage = { items: VocabularyItem[]; total: number; unclassifiedCount: number }
 type FeedPhase = 'flying' | 'chewing' | 'happy' | null
+type PetPose = 'run' | 'jump' | 'sit' | 'lie' | 'sleep' | 'eat'
 type Modal = 'review' | 'settings' | 'inbox' | 'edit' | null
+type RoamStep = { hitEdge: boolean }
 type ConfirmationRequest = {
   title: string
   description: React.ReactNode
@@ -123,8 +132,10 @@ async function audioBlobToWavBase64(blob: Blob): Promise<string> {
 }
 
 function App() {
-  const [dashboard, setDashboard] = useState<Dashboard>({ dueCount: 0, totalWords: 0, nextDueAt: null, petPassthrough: false })
+  const [dashboard, setDashboard] = useState<Dashboard>({ dueCount: 0, totalWords: 0, nextDueAt: null, dueWord: null, petPassthrough: false })
   const [modal, setModal] = useState<Modal>(null)
+  const modalRef = useRef<Modal>(null)
+  modalRef.current = modal
   const [term, setTerm] = useState('')
   const [ipa, setIpa] = useState('')
   const [translation, setTranslation] = useState('')
@@ -143,6 +154,12 @@ function App() {
   const [apiKey, setApiKey] = useState('')
   const [models, setModels] = useState<string[]>([])
   const [dragging, setDragging] = useState(false)
+  const [petHovering, setPetHovering] = useState(false)
+  const [petPose, setPetPose] = useState<PetPose>('sit')
+  const [petDirection, setPetDirection] = useState<1 | -1>(-1)
+  const petDirectionRef = useRef<1 | -1>(-1)
+  const petJumpingRef = useRef(false)
+  const petRoamQueueRef = useRef<Promise<void>>(Promise.resolve())
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [reminding, setReminding] = useState(false)
@@ -340,6 +357,82 @@ function App() {
 
   useEffect(() => () => clearRecording(), [])
 
+  const stepPetRoam = (deltaX: number, jumpOffset: number) => {
+    const step = () => api<RoamStep>('step_pet_roam', { deltaX, jumpOffset })
+    const result = petRoamQueueRef.current.then(step, step)
+    petRoamQueueRef.current = result.then(() => undefined, () => undefined)
+    return result
+  }
+  const resetPetJump = async () => {
+    if (!petJumpingRef.current || modalRef.current) return
+    petJumpingRef.current = false
+    await stepPetRoam(0, 0)
+  }
+
+  const hasDueWord = !feedingWord && Boolean(dashboard.dueWord)
+
+  useEffect(() => {
+    if (modal || petHovering || dragging || feedPhase || hasDueWord || settings.petPassthrough) {
+      setPetPose(feedPhase || hasDueWord ? 'eat' : 'sit')
+      return
+    }
+    let cancelled = false
+    let timer = 0
+    const nextPose = (): Exclude<PetPose, 'sit' | 'eat'> => {
+      const roll = Math.random()
+      return roll < 0.5 ? 'run' : roll < 0.67 ? 'jump' : roll < 0.84 ? 'lie' : 'sleep'
+    }
+    const run = async () => {
+      const pose = nextPose()
+      setPetPose(pose)
+      const duration = pose === 'run' ? 3_000 + Math.random() * 4_000 : pose === 'jump' ? 650 : pose === 'lie' ? 4_000 + Math.random() * 3_000 : 8_000 + Math.random() * 5_000
+      const started = Date.now()
+      const tick = async () => {
+        if (cancelled) return
+        if (pose === 'run' || pose === 'jump') {
+          try {
+            if (pose === 'jump') petJumpingRef.current = true
+            const result = await stepPetRoam(
+              petDirectionRef.current * (pose === 'run' ? 4 : 2),
+              pose === 'jump' ? 12 : 0,
+            )
+            if (cancelled) return
+            if (result.hitEdge) {
+              petDirectionRef.current = petDirectionRef.current === 1 ? -1 : 1
+              setPetDirection(petDirectionRef.current)
+            }
+          } catch (error) {
+            petJumpingRef.current = false
+            if (!cancelled) notify(String(error))
+            return
+          }
+        }
+        if (Date.now() - started >= duration) {
+          if (pose === 'jump') {
+            try {
+              await resetPetJump()
+            } catch (error) {
+              if (!cancelled) notify(String(error))
+              return
+            }
+          }
+          if (cancelled) return
+          setPetPose('sit')
+          timer = window.setTimeout(() => void run(), 1_500)
+        } else {
+          timer = window.setTimeout(() => void tick(), pose === 'run' ? 80 : 100)
+        }
+      }
+      void tick()
+    }
+    timer = window.setTimeout(() => void run(), 2_000)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+      void resetPetJump()
+    }
+  }, [modal, petHovering, dragging, feedPhase, hasDueWord, settings.petPassthrough])
+
   useEffect(() => {
     void refresh()
     const unlisten = Promise.all([
@@ -496,31 +589,26 @@ function App() {
       },
     })
   }
-  const petLabel = useMemo(() => dashboard.dueCount > 0 ? `${dashboard.dueCount} từ chờ ôn` : 'Inbox trống', [dashboard.dueCount])
-
   return <main className="app" aria-live="polite">
     <section
       ref={petRef}
-      className={`pet-shell ${dragging ? 'is-dragging' : ''} ${reminding ? 'is-reminding' : ''} ${feedPhase ? `is-${feedPhase}` : ''}`}
+      className={`pet-shell ${petHovering ? 'is-hovering' : ''} ${dragging ? 'is-dragging' : ''} ${reminding ? 'is-reminding' : ''} ${hasDueWord ? 'is-due' : ''} ${feedPhase ? `is-${feedPhase}` : ''}`}
       style={{ '--pet-opacity': settings.petOpacity, '--pet-scale': settings.petScale } as React.CSSProperties}
       onPointerDown={dragWindow}
+      onPointerEnter={() => setPetHovering(true)}
+      onPointerLeave={() => setPetHovering(false)}
+      onFocusCapture={() => setPetHovering(true)}
+      onBlurCapture={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setPetHovering(false) }}
       onDragEnter={(event) => { event.preventDefault(); setDragging(true) }}
       onDragOver={(event) => event.preventDefault()}
       onDragLeave={() => setDragging(false)}
       onDrop={captureDrop}
       aria-label="English Pet"
     >
-      <div className="speech" role="status">
-        <strong>{petLabel}</strong>
-        <span>{dashboard.dueCount > 0 ? 'Bấm để ôn 1 phút' : 'Bôi đen text rồi bấm Ctrl + Shift + E'}</span>
-      </div>
       {feedingWord && <span className="bone" aria-hidden="true"><span>{feedingWord}</span></span>}
-      <button className="pet corgi" aria-label="Ôn từ đến hạn" onClick={() => void openReview()}>
-        <span className="ear ear-left" /><span className="ear ear-right" />
-        <span className="blaze" /><span className="eye eye-left" /><span className="eye eye-right" />
-        <span className="muzzle" /><span className="nose" />
-        <span className="mouth"><span className="tongue" /></span>
-        <span className="cheek cheek-left" /><span className="cheek cheek-right" />
+      {hasDueWord && <span className="bone due-bone" aria-hidden="true"><span>{dashboard.dueWord}</span></span>}
+      <button className="pixel-corgi" data-pose={petPose} data-facing={petDirection === -1 ? 'left' : 'right'} aria-label={hasDueWord ? `Ôn từ: ${dashboard.dueWord}` : 'Ôn từ đến hạn'} onClick={() => void openReview()}>
+        {petPose === 'run' ? <><img className="pixel-frame-1" src={corgiRun} alt="" /><img className="pixel-frame-2" src={corgiRun2} alt="" /></> : <img src={petPose === 'jump' ? corgiJump : petPose === 'lie' || petPose === 'eat' ? corgiLie : petPose === 'sleep' ? corgiSleep : corgiSit} alt="" />}
       </button>
       {reminding && <div className="reminder-actions" aria-label="Hoãn nhắc ôn">
         <button onClick={() => void openReview()}>Ôn ngay</button>
@@ -650,7 +738,7 @@ function App() {
       <Field label="Model chấm phát âm (hỗ trợ audio)"><div className="inline"><input value={settings.audioModel} list="models" onChange={(event) => setSettings({ ...settings, audioModel: event.target.value })} placeholder="Để trống để dùng model ở trên" /></div><small className="field-hint">Chỉ dùng khi model hỗ trợ input_audio. Để trống sẽ dùng model chung.</small></Field>
       <Field label="9Router API key"><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={settings.hasApiKey ? 'Đã lưu an toàn. Nhập để thay hoặc xóa.' : 'Tùy chọn, chỉ nếu 9Router yêu cầu'} /></Field>
       <div className="setting-grid"><Field label="Desired retention"><input type="number" min="0.8" max="0.98" step="0.01" value={settings.desiredRetention} onChange={(event) => setSettings({ ...settings, desiredRetention: Number(event.target.value) })} /></Field><Field label="Giờ yên lặng từ"><input type="number" min="0" max="23" value={settings.quietHoursStart} onChange={(event) => setSettings({ ...settings, quietHoursStart: Number(event.target.value) })} /></Field><Field label="đến"><input type="number" min="0" max="23" value={settings.quietHoursEnd} onChange={(event) => setSettings({ ...settings, quietHoursEnd: Number(event.target.value) })} /></Field></div>
-      <Field label={`Kích thước pet: ${Math.round(settings.petScale * 100)}%`}><input type="range" min="0.4" max="1.25" step="0.05" value={settings.petScale} onChange={(event) => setSettings({ ...settings, petScale: Number(event.target.value) })} /></Field>
+      <Field label={`Kích thước pet: ${Math.round(settings.petScale * 100)}%`}><input type="range" min="0.1" max="1.25" step="0.05" value={settings.petScale} onChange={(event) => setSettings({ ...settings, petScale: Number(event.target.value) })} /></Field>
       <Field label={`Độ trong suốt pet: ${Math.round(settings.petOpacity * 100)}%`}><input type="range" min="0.2" max="1" step="0.05" value={settings.petOpacity} onChange={(event) => setSettings({ ...settings, petOpacity: Number(event.target.value) })} /></Field>
       <label className="check"><input type="checkbox" checked={settings.aiEnabled} onChange={(event) => setSettings({ ...settings, aiEnabled: event.target.checked })} /> Cho phép gửi từ đang thêm tới 9Router khi bấm “Tạo bằng AI”</label>
       <label className="check"><input type="checkbox" checked={settings.petPassthrough} onChange={(event) => setSettings({ ...settings, petPassthrough: event.target.checked })} /> Click xuyên pet (mở tray để bật lại tương tác)</label>
