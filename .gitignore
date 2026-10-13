@@ -1,6 +1,9 @@
 node_modules/
 dist/
 src-tauri/target/
+src-tauri/.cargo/config.toml
+*.cargoconfig.toml
+run_dev.bat
 *.db
 *.db-shm
 *.db-wal
@@ -8,3 +11,4 @@ release-output.txt
 .env
 .env.*
 !.env.example
+package-lock.json

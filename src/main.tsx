@@ -435,6 +435,7 @@ function App() {
 
   useEffect(() => {
     void refresh()
+    void api<Settings>('get_settings').then((s) => setSettings(s)).catch((error) => notify(String(error)))
     const unlisten = Promise.all([
       listen<string>('capture-selection', ({ payload }) => void feedWord(payload)),
       listen<string>('capture-error', ({ payload }) => notify(payload)),
