@@ -590,14 +590,26 @@ function App() {
       },
     })
   }
+  const petMenuCloseRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const keepPetMenuOpen = () => {
+    if (petMenuCloseRef.current) clearTimeout(petMenuCloseRef.current)
+    petMenuCloseRef.current = null
+    setPetHovering(true)
+  }
+  const closePetMenuSoon = () => {
+    if (petMenuCloseRef.current) clearTimeout(petMenuCloseRef.current)
+    petMenuCloseRef.current = setTimeout(() => {
+      setPetHovering(false)
+      petMenuCloseRef.current = null
+    }, 300)
+  }
+
   return <main className="app" aria-live="polite">
     <section
       ref={petRef}
       className={`pet-shell ${petHovering ? 'is-hovering' : ''} ${dragging ? 'is-dragging' : ''} ${reminding ? 'is-reminding' : ''} ${hasDueWord ? 'is-due' : ''} ${feedPhase ? `is-${feedPhase}` : ''}`}
       style={{ '--pet-opacity': settings.petOpacity, '--pet-scale': settings.petScale } as React.CSSProperties}
       onPointerDown={dragWindow}
-      onPointerEnter={() => setPetHovering(true)}
-      onPointerLeave={() => setPetHovering(false)}
       onFocusCapture={() => setPetHovering(true)}
       onBlurCapture={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setPetHovering(false) }}
       onDragEnter={(event) => { event.preventDefault(); setDragging(true) }}
@@ -606,23 +618,25 @@ function App() {
       onDrop={captureDrop}
       aria-label="English Pet"
     >
-      {feedingWord && <span className="bone" aria-hidden="true"><span>{feedingWord}</span></span>}
-      {hasDueWord && <span className="bone due-bone" aria-hidden="true"><span>{dashboard.dueWord}</span></span>}
-      <button className="pixel-corgi" data-pose={petPose} data-facing={petDirection === -1 ? 'left' : 'right'} aria-label={hasDueWord ? `Ôn từ: ${dashboard.dueWord}` : 'Ôn từ đến hạn'} onClick={() => void openReview()}>
-        {petPose === 'run' ? <><img className="pixel-frame-1" src={corgiRun} alt="" /><img className="pixel-frame-2" src={corgiRun2} alt="" /></> : <img src={petPose === 'jump' ? corgiJump : petPose === 'lie' || petPose === 'eat' ? corgiLie : petPose === 'sleep' ? corgiSleep : corgiSit} alt="" />}
-      </button>
-      {reminding && <div className="reminder-actions" aria-label="Hoãn nhắc ôn">
-        <button onClick={() => void openReview()}>Ôn ngay</button>
-        <button onClick={() => void snooze('hour')}>1 giờ</button>
-        <button onClick={() => void snooze('tomorrow')}>Mai 8:00</button>
-      </div>}
-      <nav className="pet-actions" aria-label="Chức năng pet">
+      <div className="pet-hover-area">
+        {feedingWord && <span className="bone" aria-hidden="true"><span>{feedingWord}</span></span>}
+        {hasDueWord && <span className="bone due-bone" aria-hidden="true"><span>{dashboard.dueWord}</span></span>}
+        <button className="pixel-corgi" data-pose={petPose} data-facing={petDirection === -1 ? 'left' : 'right'} aria-label={hasDueWord ? `Ôn từ: ${dashboard.dueWord}` : 'Ôn từ đến hạn'} onPointerEnter={keepPetMenuOpen} onPointerLeave={closePetMenuSoon} onClick={() => void openReview()}>
+          {petPose === 'run' ? <><img className="pixel-frame-1" src={corgiRun} alt="" /><img className="pixel-frame-2" src={corgiRun2} alt="" /></> : <img src={petPose === 'jump' ? corgiJump : petPose === 'lie' || petPose === 'eat' ? corgiLie : petPose === 'sleep' ? corgiSleep : corgiSit} alt="" />}
+        </button>
+        {reminding && <div className="reminder-actions" aria-label="Hoãn nhắc ôn">
+          <button onClick={() => void openReview()}>Ôn ngay</button>
+          <button onClick={() => void snooze('hour')}>1 giờ</button>
+          <button onClick={() => void snooze('tomorrow')}>Mai 8:00</button>
+        </div>}
+        <nav className={`pet-actions ${petHovering ? 'is-visible' : ''}`} aria-label="Chức năng pet" onPointerEnter={keepPetMenuOpen} onPointerLeave={closePetMenuSoon}>
         <button data-tooltip="Ôn từ đến hạn" aria-label="Ôn từ đến hạn" onClick={() => void openReview()}>📚</button>
         <button data-tooltip="Thêm từ" aria-label="Thêm từ" disabled={Boolean(feedingWord)} onClick={() => void feedWord()}>➕</button>
         <button data-tooltip="Xem từ đã thêm" aria-label="Xem từ đã thêm" onClick={() => void openInbox()}>📖</button>
         <button data-tooltip="Settings" aria-label="Settings" onClick={() => void openSettings()}>⚙</button>
         <button data-tooltip="Bật/tắt click xuyên" aria-label="Bật/tắt click xuyên" onClick={() => void togglePassthrough()}>◎</button>
       </nav>
+      </div>
     </section>
 
     {message && <div className="toast" role="alert">{message}</div>}
